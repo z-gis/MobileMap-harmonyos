@@ -1,0 +1,18 @@
+node_modules
+oh_modules
+/local.properties
+/.idea
+**/build
+/.hvigor
+.cxx
+/.clangd
+/.clang-format
+/.clang-tidy
+**/.test
+/.appanalyzer
+
+# 本地调试/一次性脚本（含机器专属绝对路径，不入库）
+/_build.ps1
+/_zd.ps1
+/_zd_out.txt
+/_pick_scan.txt

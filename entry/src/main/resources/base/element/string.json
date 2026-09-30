@@ -1,0 +1,28 @@
+{
+  "string": [
+    {
+      "name": "module_desc",
+      "value": "调查宝外业调查主模块"
+    },
+    {
+      "name": "EntryAbility_desc",
+      "value": "调查宝：林业外业调查地图应用"
+    },
+    {
+      "name": "EntryAbility_label",
+      "value": "调查宝"
+    },
+    {
+      "name": "perm_location_reason",
+      "value": "用于在地图上显示当前位置、记录轨迹与调查点定位"
+    },
+    {
+      "name": "perm_camera_reason",
+      "value": "用于外业现场拍照并关联地理坐标"
+    },
+    {
+      "name": "perm_net_reason",
+      "value": "用于加载在线地图瓦片与检查应用更新"
+    }
+  ]
+}

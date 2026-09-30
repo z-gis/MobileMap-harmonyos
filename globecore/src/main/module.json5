@@ -1,0 +1,10 @@
+﻿{
+  "module": {
+    "name": "globecore",
+    "type": "har",
+    "deviceTypes": [
+      "phone",
+      "tablet"
+    ]
+  }
+}

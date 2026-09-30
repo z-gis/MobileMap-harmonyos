@@ -1,0 +1,17 @@
+{
+  "src": [
+    "pages/Index",
+    "pages/LayerManagePage",
+    "pages/AddLayerPage",
+    "pages/SettingsPage",
+    "pages/AboutPage",
+    "pages/HelpPage",
+    "pages/TrackPage",
+    "pages/PhotoPage",
+    "pages/PhotoViewerPage",
+    "pages/FeatureDetailPage",
+    "pages/SurveyListPage",
+    "pages/SurveyEditPage",
+    "pages/AppSourcePage"
+  ]
+}

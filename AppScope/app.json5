@@ -1,0 +1,12 @@
+{
+  "app": {
+    "bundleName": "com.zys.MobileMap",
+    "vendor": "example",
+    // 版本与 Android MobileMap27 对齐（versionCode 26092701 / 0.3.0.1），使同一份 update.json 可跨端比较
+    "versionCode": 26092701,
+    "versionName": "0.3.0.1",
+    "buildVersion": "1",
+    "icon": "$media:layered_image",
+    "label": "$string:app_name"
+  }
+}

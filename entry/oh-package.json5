@@ -1,0 +1,14 @@
+﻿{
+  "name": "entry",
+  "version": "1.0.0",
+  "description": "调查宝（MobileMap27 鸿蒙移植版）应用入口模块",
+  "main": "",
+  "author": "zys",
+  "license": "Apache-2.0",
+  "dependencies": {
+    // 地图渲染内核 HAR（ArkTS 门面 + NAPI + C++ 引擎），对应 Android 侧 Maven 依赖 com.zys:globecore
+    // 包名 globecore（见 globecore/oh-package.json5），import 路径统一为 'globecore'
+    "globecore": "file:../globecore"
+  }
+}
+
