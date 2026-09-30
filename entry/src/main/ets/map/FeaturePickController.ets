@@ -1,4 +1,4 @@
-﻿// FeaturePickController.ets —— 矢量拾取与选中详情路由（对应 Android ui.map.FeaturePickController）。
+// FeaturePickController.ets —— 矢量拾取与选中详情路由（对应 Android ui.map.FeaturePickController）。
 //
 // 单击地图的命中分发顺序（与 Android 完全一致）：
 //   1) 测量采集拦截（MeasureController.handleTap 消费）；
@@ -13,7 +13,7 @@
 // （GDAL 打开 KML/DXF 可达秒级，阻塞会让弹窗迟迟不出现），经 setTimeout 让出一帧后回取并广播回填。
 
 import { common } from '@kit.AbilityKit';
-import { FeatureGeometry, NativeMapView, VectorStyle } from 'globecore';
+import { FeatureGeometry, NativeMapView, VectorStyle } from '@zys/globecore';
 import { AppLog } from '../common/AppLog';
 import { ColorHex } from '../common/ColorHex';
 import { GeoCalc, LatLng } from '../common/GeoCalc';

@@ -1,4 +1,4 @@
-﻿// TrackController.ets —— 轨迹采集控制器（对应 Android ui.map.TrackCaptureController）。
+// TrackController.ets —— 轨迹采集控制器（对应 Android ui.map.TrackCaptureController）。
 //
 // 开始/暂停/继续/停止记录、定位追加点、草稿实时落库与进程重启恢复、live 红线实时渲染，
 // 以及轨迹详情/删除。采集态 capturing 由宿主组合进 BusinessOverlayManager.rebuild 门控。
@@ -7,7 +7,7 @@
 // （否则乱序写入会让 seq 与点序不一致），故用 Promise 链当作单线程队列，链尾再触发重建。
 
 import { common } from '@kit.AbilityKit';
-import { NativeMapView, VectorStyle } from 'globecore';
+import { NativeMapView, VectorStyle } from '@zys/globecore';
 import { AppLog } from '../common/AppLog';
 import { GeoCalc, LatLng } from '../common/GeoCalc';
 import { Ui } from '../common/Ui';

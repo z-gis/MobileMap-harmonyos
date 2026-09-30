@@ -1,4 +1,4 @@
-﻿// MeasureController.ets —— 测量采集控制器（对应 Android ui.map.MeasureCaptureController）。
+// MeasureController.ets —— 测量采集控制器（对应 Android ui.map.MeasureCaptureController）。
 //
 // 点（位置）/ 距离 / 面积三模式的进入、点击加点、中心点加点、撤销、结束入库、退出；
 // live 叠加层为三层结构（与 Android 完全一致）：
@@ -9,7 +9,7 @@
 // 公开 handleTap：测量态消费点击返回 true，宿主拾取分发据此优先于矢量拾取。
 
 import { common } from '@kit.AbilityKit';
-import { NativeMapView, VectorStyle } from 'globecore';
+import { NativeMapView, VectorStyle } from '@zys/globecore';
 import { GeoCalc, LatLng } from '../common/GeoCalc';
 import { AppLog } from '../common/AppLog';
 import { Ui } from '../common/Ui';

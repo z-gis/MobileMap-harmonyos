@@ -1,4 +1,4 @@
-﻿// EntryAbility.ets —— 应用入口（对应 Android 的 Application + MainActivity 启动初始化段）。
+// EntryAbility.ets —— 应用入口（对应 Android 的 Application + MainActivity 启动初始化段）。
 //
 // 启动链与 Android MainActivity.initializeAndSetup() 逐项等价，且顺序不可调换：
 //   1) AppDirs.init：建全目录树（调查宝/{layer,map,Media,sample,config,tiles,log}）并把日志落到 调查宝/log，
@@ -11,7 +11,7 @@
 // 只能在页面树里创建，Ability 侧仅负责上述「进程级一次性」初始化。
 import { AbilityConstant, ConfigurationConstant, UIAbility, Want } from '@kit.AbilityKit';
 import { window } from '@kit.ArkUI';
-import { NativeNet, NativeSrs } from 'globecore';
+import { NativeNet, NativeSrs } from '@zys/globecore';
 import { AppDirs } from '../common/AppDirs';
 import { AppLog } from '../common/AppLog';
 import { SystemInsets } from '../common/SystemInsets';

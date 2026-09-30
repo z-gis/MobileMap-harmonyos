@@ -1,4 +1,4 @@
-﻿// MapLayerController.ets —— 图层栈管理（对应 Android ui.map.MapLayerManager）。
+// MapLayerController.ets —— 图层栈管理（对应 Android ui.map.MapLayerManager）。
 //
 // 职责：瓦片底图/注记 + 矢量 + 栅格三类图层的常驻装配、可见性驱动、懒加入同步与结构签名判定。
 // 内核约束决定了整体策略（与 Android 同一内核实现，故口径完全一致）：
@@ -8,7 +8,7 @@
 //  · 懒加入：不可见层不下发 native，避免无谓的 GDAL 读取与加载胶囊误亮，首次转可见时再补加入。
 // 依赖单向：构造注入内核视图引用，非结构变化时的就地同步在此完成，需重建时返回 true 交宿主。
 
-import { NativeMapView, VectorExtent } from 'globecore';
+import { NativeMapView, VectorExtent } from '@zys/globecore';
 import { AppDirs } from '../common/AppDirs';
 import { AppLog } from '../common/AppLog';
 import { ColorHex } from '../common/ColorHex';

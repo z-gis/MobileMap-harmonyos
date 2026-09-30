@@ -1,4 +1,4 @@
-﻿// GdalVectorReader.ets —— GDAL/OGR 矢量读取业务包装（对应 Android vector.GdalVectorReader）。
+// GdalVectorReader.ets —— GDAL/OGR 矢量读取业务包装（对应 Android vector.GdalVectorReader）。
 //
 // native 调用经渲染内核 NativeVector 门面（实现见引擎 bridge/vector_io.cpp），本类只做 JSON 解析与业务包装。
 // JNI/NAPI 返回契约（两端一致）：
@@ -9,7 +9,7 @@
 // Android 侧的流式 JsonReader 分支（Phase 4 优化）不迁移：ArkTS 无对应流式读取器，
 // 且该分支默认关闭（VectorReloadConfig.USE_STREAMING_JSON=false），树形解析即既有行为。
 
-import { NativeLayerInfo, NativeVector } from 'globecore';
+import { NativeLayerInfo, NativeVector } from '@zys/globecore';
 import { AppLog } from '../common/AppLog';
 
 const TAG: string = 'GdalVectorReader';

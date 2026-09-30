@@ -1,4 +1,4 @@
-﻿// AboutPage.ets —— 关于页（对应 Android ui.activity.AboutActivity + activity_about.xml）。
+// AboutPage.ets —— 关于页（对应 Android ui.activity.AboutActivity + activity_about.xml）。
 //
 // 内容与 Android 相同：GDAL 版本（点击展开其矢量驱动清单）、PROJ 版本、本机版本名/号、
 // 检查更新、项目主页。差异：
@@ -10,7 +10,7 @@
 // GDAL/PROJ 版本经 native 同步可得，故 aboutToAppear 直接回显；驱动清单惰性加载（首次展开才取）。
 
 import { common, Want } from '@kit.AbilityKit';
-import { NativeLayerInfo, NativeSrs } from 'globecore';
+import { NativeLayerInfo, NativeSrs } from '@zys/globecore';
 import { AppConfig } from '../common/AppConfig';
 import { Theme } from '../common/Theme';
 import { Ui } from '../common/Ui';

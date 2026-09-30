@@ -1,4 +1,4 @@
-﻿// CameraNavigator.ets —— 相机导航与状态栏（对应 Android ui.map.CameraNavigator）。
+// CameraNavigator.ets —— 相机导航与状态栏（对应 Android ui.map.CameraNavigator）。
 //
 // 职责：缩放/四至定位/移动相机、级别与中心坐标轮询刷新、相机静止检测（驱动大数据矢量层重载）、
 // 相机视角独立持久化（仅视角：视图模式 0.3.0.1 起改存 SystemConfig.viewMode3d，不再随相机落盘）。
@@ -8,7 +8,7 @@
 // 页面 onPause/隐藏时须 stopPolling，避免后台空转与销毁后回调。
 
 import { common } from '@kit.AbilityKit';
-import { Camera, NativeMapView, VectorExtent } from 'globecore';
+import { Camera, NativeMapView, VectorExtent } from '@zys/globecore';
 import { AppLog } from '../common/AppLog';
 import { CoordFormatter } from '../common/Coord';
 import { MercatorZoom } from '../common/MercatorZoom';

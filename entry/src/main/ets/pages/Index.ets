@@ -1,4 +1,4 @@
-﻿// Index.ets —— 主地图页（对应 Android ui.activity.MainActivity）。
+// Index.ets —— 主地图页（对应 Android ui.activity.MainActivity）。
 //
 // 本页是全部功能域的装配点：创建内核视图与八个地图控制器、按 Android 侧同一顺序互接回调、
 // 装配图层与相机、拾取分流到各详情入口、HUD 控件（缩放/注记/定位/测量/轨迹/拍照/移动到）。
@@ -13,7 +13,7 @@
 
 import { common } from '@kit.AbilityKit';
 import { display, router } from '@kit.ArkUI';
-import { Camera, NativeMapView, VectorExtent, ViewMode } from 'globecore';
+import { Camera, NativeMapView, VectorExtent, ViewMode } from '@zys/globecore';
 import { LocationDetailDialog } from '../components/LocationDetailDialog';
 import { MeasureDetailDialog } from '../components/MeasureDetailDialog';
 import { MediaEditDialog } from '../components/MediaEditDialog';

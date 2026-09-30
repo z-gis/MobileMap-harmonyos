@@ -27,11 +27,6 @@
   },
   "modules": [
     {
-      // 地图渲染内核 HAR（由 GlobeCore 鸿蒙工程同构引入，本仓库内自包含一份鸿蒙平台门面）
-      "name": "globecore",
-      "srcPath": "./globecore"
-    },
-    {
       "name": "entry",
       "srcPath": "./entry",
       "targets": [

@@ -1,4 +1,4 @@
-﻿// LocationController.ets —— 定位展示与跟随（对应 Android ui.map.LocationFollowController）。
+// LocationController.ets —— 定位展示与跟随（对应 Android ui.map.LocationFollowController）。
 //
 // 注册 LocationManager 监听、喂内核绘制罗盘定位标记（含方向箭头）、回调定位坐标文本、
 // 跟随锁定时把相机平移到定位点；轨迹采集的定位追加点经 onTrackLocation 由宿主接线到 TrackController。
@@ -6,7 +6,7 @@
 // 权限申请留在页面侧（鸿蒙 requestPermissionsFromUser 需 UIAbilityContext 且为异步弹窗），
 // 授权结果回调转 startLocating()。
 
-import { NativeMapView, Position } from 'globecore';
+import { NativeMapView, Position } from '@zys/globecore';
 import { DocumentManager } from '../doc/DocumentManager';
 import { CoordFormatter } from '../common/Coord';
 import { GeoCalc } from '../common/GeoCalc';

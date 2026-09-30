@@ -1,4 +1,4 @@
-﻿// SqlQueryController.ets —— SQL 可视化查询高亮（对应 Android ui.map.SqlQueryController）。
+// SqlQueryController.ets —— SQL 可视化查询高亮（对应 Android ui.map.SqlQueryController）。
 //
 // 图层管理页 shp/gpkg 的查询键经 GdalVectorReader.queryFeatures 取命中要素（已重投影 WGS84），
 // 清除旧高亮后按几何类型叠加洋红高亮叠加层并缩放到结果四至。
@@ -8,7 +8,7 @@
 //  · sourcePathIfHit：高亮层命中时回源文件路径，供 FeaturePickController 穿透弹源要素详情
 //    （高亮层已置 noPick 不参与 native 拾取，本方法仅作防护兜底）。
 
-import { NativeMapView, VectorStyle } from 'globecore';
+import { NativeMapView, VectorStyle } from '@zys/globecore';
 import { AppLog } from '../common/AppLog';
 import { Ui } from '../common/Ui';
 import { GeomType, GdalVectorReader, VectorFeature, VectorResult } from '../vector/GdalVectorReader';

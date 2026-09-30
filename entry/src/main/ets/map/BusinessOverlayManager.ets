@@ -1,4 +1,4 @@
-﻿// BusinessOverlayManager.ets —— 业务叠加层显示与命中映射（对应 Android ui.map.BusinessOverlayManager）。
+// BusinessOverlayManager.ets —— 业务叠加层显示与命中映射（对应 Android ui.map.BusinessOverlayManager）。
 //
 // 测量 / 轨迹 / 拍照 / 样地四类业务数据存于关系库（非 document.json），经内核动态叠加层渲染：
 //  · 数据签名判定：仅当「记录摘要 + 可见性开关」变化才 clearOverlayLayers 重建，避免每次文档变更无谓重建；
@@ -7,7 +7,7 @@
 // 内核索引口径：叠加层与文件矢量层共享索引空间，clearOverlayLayers 后叠加层索引重置，映射须随重建刷新。
 
 import { common } from '@kit.AbilityKit';
-import { NativeMapView, VectorStyle } from 'globecore';
+import { NativeMapView, VectorStyle } from '@zys/globecore';
 import { AppLog } from '../common/AppLog';
 import { ColorHex } from '../common/ColorHex';
 import { GeoCalc, LatLng } from '../common/GeoCalc';

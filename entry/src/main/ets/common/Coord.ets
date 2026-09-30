@@ -1,11 +1,11 @@
-﻿// Coord.ets —— 坐标转换与坐标文本格式化（对应 Android util.CoordTransform + util.CoordFormatter）。
+// Coord.ets —— 坐标转换与坐标文本格式化（对应 Android util.CoordTransform + util.CoordFormatter）。
 //
 // 转换口径：WGS84 经纬度 ↔ CGCS2000 3 度带高斯-克吕格平面坐标（米，东坐标含带号前缀），
 // 经渲染内核 NativeSrs.convert（C++ 侧按「源|目标」缓存 PROJ 管道）执行，可承受状态栏逐帧刷新。
 // 不可用（proj.db 未就绪 / 编码非法 / native 异常）时置 unavailable 并返回 null，
 // 由 CoordFormatter 回退十进制度显示——坐标显示绝不能因转换失败而中断渲染。
 
-import { NativeSrs } from 'globecore';
+import { NativeSrs } from '@zys/globecore';
 import { AppLog } from './AppLog';
 
 /** 转换结果平面坐标（米）：easting=东坐标（含带号）、northing=北坐标 */

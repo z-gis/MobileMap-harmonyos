@@ -1,9 +1,9 @@
-﻿// MapStyle.ets —— 地图样式常量与文档样式→渲染样式映射（对应 Android ui.map.MapStyleColors）。
+// MapStyle.ets —— 地图样式常量与文档样式→渲染样式映射（对应 Android ui.map.MapStyleColors）。
 //
 // 全部色值为 #AARRGGBB 无符号数值，与渲染内核 VectorStyle 字段同语义；
 // 业务叠加层（测量/轨迹/照片/样地/查询/选中）的配色集中在此，保证地图显示与对话框回显同源。
 
-import { VectorStyle } from 'globecore';
+import { VectorStyle } from '@zys/globecore';
 import { ColorHex } from '../common/ColorHex';
 import { StyleOverride } from '../doc/DocModels';
 
