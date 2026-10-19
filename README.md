@@ -1,10 +1,10 @@
 # MobileMap-harmonyos（调查宝 · HarmonyOS 版）
 
-调查宝（MobileMap 0.3.0.1）的 **HarmonyOS NEXT** 移植工程：面向野外调查/测绘场景的离线地图与矢量数据应用，集成自研地图渲染内核，以 ohpm 公开发布包 [`@zys/globecore`](https://ohpm.openharmony.cn/ohpm/@zys/globecore) 形式消费（ArkTS 门面 + NAPI + 共享 C++ 引擎，静态链接 GDAL/PROJ/libcurl 等，预打包 `libglobecore.so`）。
+调查宝（MobileMap 0.4.0.4）的 **HarmonyOS NEXT** 移植工程：面向野外调查/测绘场景的离线地图与矢量数据应用，集成自研地图渲染内核，以 ohpm 公开发布包 [`@zys/globecore`](https://ohpm.openharmony.cn/ohpm/@zys/globecore) 形式消费（ArkTS 门面 + NAPI + 共享 C++ 引擎，静态链接 GDAL/PROJ/libcurl 等，预打包 `libglobecore.so`）。
 
 - **包名**：`com.zys.MobileMap`
 - **应用名**：调查宝
-- **版本**：`0.3.0.1`（versionCode `26092701`，与 Android MobileMap27 对齐，同一份 `update.json` 可跨端比较）
+- **版本**：`0.4.0.4`（versionCode `26101706`，与 Android MobileMap 对齐，同一份 `update.json` 可跨端比较）
 - **runtimeOS**：HarmonyOS ｜ targetSdk `26.0.0` ｜ compatibleSdk `5.0.0(12)`
 
 ## 架构与模块
