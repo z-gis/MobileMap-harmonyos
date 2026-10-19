@@ -108,6 +108,14 @@ export class BusinessOverlayManager {
     if (sig === this.overlaySignature) {
       return;
     }
+    // TOCTOU 二次确认（对齐安卓 rebuild 全程同步的隐含保证）：本函数为 async，顶部门控是异步前的快照，
+    // 上面几个 await 期间事件循环可能已处理 activate()——采集态由 false 翻转为 true、live 层刚建出。
+    // 若此时继续执行，clearOverlayLayers 会把这几层标记为 dead，之后每次点击的 updateOverlay* 都写进
+    // dead 层被内核静默丢弃，表现为「加点/标注时有时无、无规律」。故此处再查一次采集态：命中即挂起本次
+    // 重建，且不改写 overlaySignature，待退出采集的 rebuildOverlays 用同一签名再触发一次真正刷新。
+    if (this.isCapturing()) {
+      return;
+    }
     this.overlaySignature = sig;
 
     this.view.clearOverlayLayers();

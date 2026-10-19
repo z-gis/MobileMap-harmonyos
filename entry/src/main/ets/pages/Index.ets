@@ -344,6 +344,13 @@ struct Index {
       measure.setViewportSize(this.vpWidth * this.density, this.vpHeight * this.density);
     }
 
+    // 字体先行加载（对齐 Android MainActivity.setFontPath("")）：native FontAtlas 只能由宿主显式触发
+    // 加载，否则 drawVectorLabels/drawVectorLabels3D 首行 isLoaded() 判假即整体早退，矢量层与叠加层的
+    // 文字标注一个都不出（几何线/面/点照画）——表现为「测量有线面无标注文字」。空串走 native 系统字体自动
+    // 探测；必须在矢量层/叠加层装配之前调用，使首帧即带字体。若日志报「未找到可用系统字体」，需改为随包
+    // 附带字体文件并传其可读绝对路径。
+    view.setFontPath('');
+
     // 图层栈与相机：相机必须先于矢量层就位，使大数据矢量层首屏按视口范围加载
     layers.buildLayers(doc);
     layers.syncRasterLayers(doc);
@@ -398,6 +405,12 @@ struct Index {
     this.layers = layers;
     this.overlays = overlays;
     this.measure = measure;
+    // 视口兜底下发：onAreaChange 若先于本行赋值 this.measure 触发（当时 measure 仍 undefined 被跳过），
+    // 之后区域不再变化 → measure.vpWidth 恒为 0 → addCenterPoint 直接 return（中心点取坐标无反应）。
+    // 赋值后立即用当前尺寸补一次，闭合这一时序空窗（与 onAreaChange 同 px 口径）。
+    if (this.vpWidth > 0) {
+      measure.setViewportSize(this.vpWidth * this.density, this.vpHeight * this.density);
+    }
     this.track = track;
     this.locationCtl = location;
     this.sql = sql;
@@ -798,11 +811,14 @@ struct Index {
     this.annotationOn = layers.toggleAnnotation();
   }
 
-  /** 定位键：只做「一次性把中心移到定位点」（持续跟随锁定改由轨迹记录态驱动，本键不再切换） */
+  /**
+   * 定位键：按记录态分流（0.3.0.4 对齐 Android）。
+   * 非记录中一次性回到定位点、不锁定；记录中点击切换跟随锁定。
+   */
   private focusLocation(): void {
     const location: LocationController | undefined = this.locationCtl;
     if (location !== undefined) {
-      location.focusOnce();
+      location.onLocateClicked(this.trackRecording);
     }
   }
 
@@ -1133,7 +1149,7 @@ struct Index {
       },
     })
     MapIconButton({
-      // 标签反映跟随锁定态（现由轨迹记录驱动），点击本身只做单次定位
+      // 标签反映跟随锁定态（现由轨迹记录驱动）；点击按记录态分流（非记录单次定位、记录中切换锁定）
       label: this.following ? '跟随' : '定位',
       action: (): void => {
         this.focusLocation();

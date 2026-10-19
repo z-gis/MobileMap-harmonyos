@@ -118,6 +118,9 @@ export class FeaturePickController {
    * 未命中任何矢量要素时不弹窗（底图/注记不参与点选）。
    */
   onMapTap(x: number, y: number): void {
+    // [MeasProbe] ArkTS 实收到回传单击（若之前 native 已 fire/enqueue 而此处无日志，
+    // 说明 tsfn 已回但 JS 回调丢失）；坐标应为 px（与视口 px 同量级）
+    AppLog.i(`[MeasProbe] onMapTap 收到回传 (${x.toFixed(1)},${y.toFixed(1)})`);
     // 测量采集模式：拦截点击用于加点（优先于拾取）
     if (this.measureController.handleTap(x, y)) {
       return;

@@ -395,9 +395,9 @@ struct FeatureDetailPage {
     router.pushUrl({ url: 'pages/SurveyListPage', params: params });
   }
 
-  /** 标注字段候选：首项固定「不标注」 */
+  /** 标注字段候选：仅真实字段（标注启停统一由「显示标注」开关控制，不再有「不标注」项，对齐 Android 0.3.0.4） */
   private fieldOptions(): SelectOption[] {
-    const options: SelectOption[] = [{ value: LABEL_FIELD_NONE }];
+    const options: SelectOption[] = [];
     for (let i = 0; i < this.labelFields.length; i++) {
       options.push({ value: this.labelFields[i] });
     }
@@ -405,11 +405,8 @@ struct FeatureDetailPage {
   }
 
   private fieldIndex(): number {
-    if (!this.labelEnabled) {
-      return 0;
-    }
     const at: number = this.labelFields.indexOf(this.labelField);
-    return at < 0 ? 0 : at + 1;
+    return at < 0 ? 0 : at;
   }
 
   // ── 界面 ────────────────────────────────────────────────────────
@@ -610,67 +607,68 @@ struct FeatureDetailPage {
           title: '显示标注',
           isOn: this.labelEnabled,
           onSwitchChange: (v: boolean): void => {
+            // 仅切换下方控件显隐，不清空已选字段/颜色（关闭重开恢复原选择，对齐 Android 0.3.0.4）；
+            // 首次开启且尚未选字段时默认落到首个候选，保证下拉有合法选中项
             this.labelEnabled = v;
-            if (!v) {
-              this.labelField = LABEL_FIELD_NONE;
+            if (v && this.labelField === LABEL_FIELD_NONE && this.labelFields.length > 0) {
+              this.labelField = this.labelFields[0];
             }
           },
         })
-        Row() {
-          Text('标注字段')
-            .fontSize(Theme.FONT)
-            .fontColor(Theme.TEXT)
-            .width(72)
-          // 不加 .enabled(labelEnabled)：Android 的 Spinner 从不受标注开关限制，字段随时可选
-          // （开关只决定保存时是否写 labelField）；置灰会使“未开标注”下点开看不到任何候选。
-          // 选到真实字段即在 onSelect 里把开关同步打开，语义与 Android 一致。
-          Select(this.fieldOptions())
-            .selected(this.fieldIndex())
-            .value(this.labelEnabled ? this.labelField : LABEL_FIELD_NONE)
-            .layoutWeight(1)
-            .backgroundColor(Theme.SUBTLE)
-            .onSelect((index: number): void => {
-              this.labelEnabled = index > 0;
-              this.labelField = index > 0 && index - 1 < this.labelFields.length
-                ? this.labelFields[index - 1] : LABEL_FIELD_NONE;
-            })
-        }
-        .width('100%')
-        .height(40)
+        // 关闭标注时隐藏字段/颜色/轮廓/大小控件（仅隐藏、状态保留），重新打开即恢复原选择
+        if (this.labelEnabled) {
+          Row() {
+            Text('标注字段')
+              .fontSize(Theme.FONT)
+              .fontColor(Theme.TEXT)
+              .width(72)
+            Select(this.fieldOptions())
+              .selected(this.fieldIndex())
+              .value(this.labelField === LABEL_FIELD_NONE ? '' : this.labelField)
+              .layoutWeight(1)
+              .backgroundColor(Theme.SUBTLE)
+              .onSelect((index: number): void => {
+                if (index >= 0 && index < this.labelFields.length) {
+                  this.labelField = this.labelFields[index];
+                }
+              })
+          }
+          .width('100%')
+          .height(40)
 
-        ColorRow({
-          label: '字体色',
-          color: this.labelColor,
-          dim: !this.labelEnabled,
-          onTap: (): void => {
-            this.pickColor(TARGET_LABEL);
-          },
-        })
-        SwitchRow({
-          title: '字体轮廓',
-          isOn: this.labelOutlineEnabled,
-          onSwitchChange: (v: boolean): void => {
-            this.labelOutlineEnabled = v;
-          },
-        })
-        ColorRow({
-          label: '轮廓色',
-          color: this.labelOutlineColor,
-          dim: !this.labelOutlineEnabled,
-          onTap: (): void => {
-            this.pickColor(TARGET_LABEL_OUTLINE);
-          },
-        })
-        StepField({
-          label: '字号',
-          suffix: '磅',
-          min: SIZE_MIN,
-          max: SIZE_MAX,
-          value: this.labelSizePt,
-          onValueChange: (v: number): void => {
-            this.labelSizePt = v;
-          },
-        })
+          ColorRow({
+            label: '字体色',
+            color: this.labelColor,
+            onTap: (): void => {
+              this.pickColor(TARGET_LABEL);
+            },
+          })
+          SwitchRow({
+            title: '字体轮廓',
+            isOn: this.labelOutlineEnabled,
+            onSwitchChange: (v: boolean): void => {
+              this.labelOutlineEnabled = v;
+            },
+          })
+          ColorRow({
+            label: '轮廓色',
+            color: this.labelOutlineColor,
+            dim: !this.labelOutlineEnabled,
+            onTap: (): void => {
+              this.pickColor(TARGET_LABEL_OUTLINE);
+            },
+          })
+          StepField({
+            label: '字号',
+            suffix: '磅',
+            min: SIZE_MIN,
+            max: SIZE_MAX,
+            value: this.labelSizePt,
+            onValueChange: (v: number): void => {
+              this.labelSizePt = v;
+            },
+          })
+        }
       }
     }
     .width('100%')

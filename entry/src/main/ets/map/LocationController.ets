@@ -128,6 +128,27 @@ export class LocationController {
   }
 
   /**
+   * 定位键按记录态分流（对齐 Android LocationFollowController.onLocateClicked，0.3.0.4）：
+   *  · 非记录中：仅一次性回到定位位置、不锁定（锁定仍由轨迹开始记录驱动）；
+   *  · 记录中：切换锁定——已锁定则取消锁定且不调整位置，未锁定则恢复跟随锁定并立即回到当前定位。
+   * @param recording 轨迹是否处于记录中（由宿主传 track.isRecording()）
+   */
+  onLocateClicked(recording: boolean): void {
+    if (!recording) {
+      this.focusOnce();
+      return;
+    }
+    if (this.followEnabled) {
+      // 取消锁定：仅解除跟随，不移动相机（用户可能已手动移到别处查看）
+      this.setFollowEnabled(false);
+    } else {
+      // 恢复锁定跟随并立即回到当前定位
+      this.setFollowEnabled(true);
+      this.focusOnce();
+    }
+  }
+
+  /**
    * 计算从上一次定位点到当前点的移动方位角（顺时针自北 0..360）；
    * 无历史点或位移小于阈值时返回 undefined（不更新方向）。
    */

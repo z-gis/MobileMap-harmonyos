@@ -122,7 +122,6 @@ export class MeasureController {
     const geo = this.view.screenToGeo(x, y);
     if (geo === undefined) {
       // 3D 下射线指向天空（或未命中椭球）不加点：不能静默吞掉点击，否则看起来像「点了没反应」
-      AppLog.w('测量加点未命中地表', `x=${x} y=${y} mode=${this.mode}`);
       Ui.toast('该点未命中地表，请点向地图区域');
       return true;
     }
@@ -198,7 +197,7 @@ export class MeasureController {
   private renderLive(): void {
     const idx: number = this.liveIndex;
     if (idx < 0) {
-      return;
+      return; // live 几何层已丢失（可能被 rebuild 清除、采集态门控未生效），不推送几何
     }
     this.renderLiveMarkers();
     if (this.mode === MeasureMode.POINT) {

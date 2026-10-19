@@ -446,6 +446,8 @@ export class MapLayerController {
     const labelField: string = suppressLabel ? '' : ((effective !== undefined
       && effective.labelField !== undefined ? effective.labelField.trim() : ''));
     const style = MapStyle.toVectorStyle(effective, labelField);
+    // 单要素样式覆盖：fid → 8 字段串，与整层样式同源下传（空串 = 无覆盖，零回归）
+    style.featureStyleOverride = this.buildFeatureStyleOverride(effective);
 
     // 点要素图标：按 iconKey 程序化生成 ARGB 位图（内核侧作 billboard 纹理，无法自行解码图片资源）
     const iconArgb: number[] = FeatureIcons.pixels(FeatureIcons.keyOf(effective),
@@ -489,6 +491,58 @@ export class MapLayerController {
     }
     AppLog.i(`矢量层[${info.displayName()}] index=${idx} direct=${direct} count=${count} path=${path}`);
     return idx;
+  }
+
+  /**
+   * 把文档单要素样式覆盖（featureStyles: fid → StyleOverride）拼为 native 下传串，与整层样式同源下传。
+   * 条目以 ';' 分隔，每条目 8 字段逗号分隔：
+   *   `fid,fillArgb,lineArgb,labelFieldName,labelArgb,labelSize,labelOutline,labelOutlineArgb`
+   * - 各 ARGB 为 #AARRGGBB 无符号十进制（ArkTS number 无溢出，直接 toString 即无符号）；'-' = 该通道未显式设过（继承整层）；
+   * - labelFieldName = 该要素要标注的属性字段名（约定不含 ','/';'，含则退回 '-' 不污染分隔）；
+   * - labelSize 为浮点串；labelOutline 为 1/0。
+   * 仅当对应字段非空才视作显式设过；无任何覆盖通道时整条跳过；空表返回空串（零回归）。
+   * 逻辑与 Android 侧 MapLayerManager.buildFeatureStyleOverride 一致。
+   */
+  private buildFeatureStyleOverride(vs: StyleOverride | undefined): string {
+    if (vs === undefined || vs === null || vs.featureStyles.size === 0) {
+      return '';
+    }
+    const entries: string[] = [];
+    vs.featureStyles.forEach((s: StyleOverride, fid: number) => {
+      const hasFill: boolean =
+        s.fillColor !== undefined || s.fillOpacity !== undefined || s.fillEnabled !== undefined;
+      const hasLine: boolean = s.outlineColor !== undefined;
+      const labelName: string = s.labelField !== undefined ? s.labelField.trim() : '';
+      const hasLabel: boolean =
+        labelName.length > 0 && labelName.indexOf(',') < 0 && labelName.indexOf(';') < 0;
+      const hasLabelColor: boolean = s.labelColor !== undefined;
+      const hasLabelSize: boolean = s.labelSize !== undefined;
+      const hasLabelOutline: boolean = s.labelOutline !== undefined;
+      const hasLabelOutlineColor: boolean = s.labelOutlineColor !== undefined;
+      if (!hasFill && !hasLine && !hasLabel && !hasLabelColor
+        && !hasLabelSize && !hasLabelOutline && !hasLabelOutlineColor) {
+        return;
+      }
+      // 填充：关闭（fillEnabled=false）→ alpha 置 0，否则按色值 + 透明度解析（未设色值时取默认填充本色）
+      let fillStr: string = '-';
+      if (hasFill) {
+        const fillArgb: number = s.fillEnabled === false ? 0 : MapStyle.resolveFillColor(
+          s.fillColor !== undefined ? s.fillColor : `#${ColorHex.toHex(MapStyle.DEFAULT_FILL_COLOR)}`,
+          s.fillOpacity, s.fillEnabled);
+        fillStr = fillArgb.toString();
+      }
+      const lineStr: string = hasLine && s.outlineColor !== undefined
+        ? ColorHex.parse(s.outlineColor, MapStyle.DEFAULT_POLYGON_OUTLINE_COLOR).toString() : '-';
+      const labelArgbStr: string = hasLabelColor && s.labelColor !== undefined
+        ? ColorHex.parse(s.labelColor, MapStyle.DEFAULT_LABEL_COLOR).toString() : '-';
+      const labelOutlineArgbStr: string = hasLabelOutlineColor && s.labelOutlineColor !== undefined
+        ? ColorHex.parse(s.labelOutlineColor, MapStyle.DEFAULT_LABEL_OUTLINE_COLOR).toString() : '-';
+      const sizeStr: string = hasLabelSize && s.labelSize !== undefined ? s.labelSize.toString() : '-';
+      const outlineStr: string = hasLabelOutline ? (s.labelOutline === true ? '1' : '0') : '-';
+      entries.push(`${fid},${fillStr},${lineStr},${hasLabel ? labelName : '-'},` +
+        `${labelArgbStr},${sizeStr},${outlineStr},${labelOutlineArgbStr}`);
+    });
+    return entries.join(';');
   }
 
   /** 图层四至缓存读取（WGS84）；未缓存则开文件取一次，失败不写缓存（下次重试） */

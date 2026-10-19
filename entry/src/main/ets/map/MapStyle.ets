@@ -77,6 +77,10 @@ export class MapStyle {
       false, MapStyle.DEFAULT_LABEL_OUTLINE_COLOR);
     const o: StyleOverride | undefined = override;
     if (o !== undefined && o !== null) {
+      // 逐要素源文件配色门控（对齐 Android MapLayerManager）：整层显式设了该通道（doc 字段非空）才覆盖
+      // KML 逐要素原色；未设的通道保留源文件原色（fillEnabled=false 视为显式关闭填充，亦覆盖为仅描边）。
+      style.fillExplicit = o.fillColor !== undefined || o.fillOpacity !== undefined || o.fillEnabled !== undefined;
+      style.lineExplicit = o.outlineColor !== undefined;
       const outline: string | undefined = o.outlineColor;
       if (outline !== undefined) {
         const argb: number = ColorHex.parse(outline, MapStyle.DEFAULT_POLYGON_OUTLINE_COLOR);

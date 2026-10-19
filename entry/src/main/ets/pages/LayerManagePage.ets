@@ -27,6 +27,7 @@ import { MapStyle } from '../map/MapStyle';
 import { GdalVectorReader } from '../vector/GdalVectorReader';
 import { VectorFormats } from '../vector/VectorFormats';
 import { LayerLevelDialog } from '../components/LayerLevelDialog';
+import { LayerInfoDialog, LayerInfoItem } from '../components/LayerInfoDialog';
 import { LayerStylePreview } from '../components/LayerStylePreview';
 import { MapSourceList } from '../components/MapSourceList';
 import { SqlQueryDialog } from '../components/SqlQueryDialog';
@@ -96,6 +97,7 @@ struct LayerManagePage {
 
   private levelDialog: CustomDialogController | undefined = undefined;
   private sqlDialog: CustomDialogController | undefined = undefined;
+  private infoDialog: CustomDialogController | undefined = undefined;
   private docListener: DocumentListener | undefined = undefined;
 
   aboutToAppear(): void {
@@ -428,13 +430,21 @@ struct LayerManagePage {
     return AppDirs.deriveBaseName(slash >= 0 ? s.substring(slash + 1) : s);
   }
 
-  /** 图层信息：名称 / 类型 / 大小 / 坐标系 / 路径（Android onShowInfo 同字段） */
+  /** 图层信息：名称 / 类型 / 大小 / 坐标系 / 路径各项独立成行（0.3.0.4 对齐 Android dialog_layer_info，每项可单独复制） */
   private showInfo(row: LayerRow): void {
-    const typeText: string = row.vector ? '矢量图层' : '栅格图层';
-    const srsText: string = LayerManagePage.srsTextOf(row.path);
-    const message: string = `名称：${row.name}\n\n类型：${typeText}\n\n大小：`
-      + `${LayerManagePage.sizeText(row.path)}\n\n坐标系：${srsText}\n\n路径：${row.path}`;
-    Ui.alert('图层信息', message);
+    const items: LayerInfoItem[] = [];
+    items.push(new LayerInfoItem('名称', row.name));
+    items.push(new LayerInfoItem('类型', row.vector ? '矢量图层' : '栅格图层'));
+    items.push(new LayerInfoItem('大小', LayerManagePage.sizeText(row.path)));
+    items.push(new LayerInfoItem('坐标系', LayerManagePage.srsTextOf(row.path)));
+    items.push(new LayerInfoItem('路径', row.path));
+    this.infoDialog = new CustomDialogController({
+      builder: LayerInfoDialog({ items: items }),
+      customStyle: true,
+      alignment: DialogAlignment.Center,
+      autoCancel: true,
+    });
+    this.infoDialog.open();
   }
 
   /** 坐标系名：原生返回「名称\nproj4」，界面只取首行 */
