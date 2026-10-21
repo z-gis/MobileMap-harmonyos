@@ -8,10 +8,10 @@
   "dependencies": {
     // 地图渲染内核 HAR（ArkTS 门面 + NAPI + C++ 引擎），ohpm 公开发布包
     // 见 https://ohpm.openharmony.cn/ohpm/@zys/globecore，import 路径统一为 '@zys/globecore'
-    "@zys/globecore": "0.1.2"
+    "@zys/globecore": "0.1.4"
     // 本地测试（改引擎后先本地验证，满意再发布/升版本号）：临时将上一行注释掉、启用下面这行，指向我本地新打的 har；
     // har 由 GlobeCore 仓构建产出，file: 路径相对本文件（entry/）目录；改完需 Sync / ohpm install 重新链接，验证后记得改回 registry 版本。
-    //"@zys/globecore": "file:../../GlobeCore/globecore-harmonyos/library/build/default/outputs/default/@zys-globecore-0.1.2.har",
+    //"@zys/globecore": "file:../../GlobeCore/globecore-harmonyos/library/build/default/outputs/default/@zys-globecore-0.1.4.har",
   }
 }
 

@@ -43,6 +43,8 @@ export class PageKeys {
   static readonly SURVEY_ENTRY: string = 'surveyEntry';
   /** 导入图层的最后一个文件路径：添加图层页写入，主界面消费后缩放到其四至 */
   static readonly IMPORTED_LAYER_PATH: string = 'importedLayerPath';
+  /** 工程已切换（工程管理页打开/新建写入，主界面消费后刷新数据）：值为新工程名 */
+  static readonly PROJECT_CHANGED: string = 'projectChanged';
 }
 
 /**

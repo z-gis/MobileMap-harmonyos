@@ -20,7 +20,8 @@ import { GeoCalc, LatLng } from '../common/GeoCalc';
 import { Ui } from '../common/Ui';
 import { LayerInfo, StyleOverride } from '../doc/DocModels';
 import { DocumentManager } from '../doc/DocumentManager';
-import { MediaPlacemark, MediaStore } from '../media/MediaStore';
+import { ProjectManager } from '../project/ProjectManager';
+import { PhotoRecord } from '../project/ProjectModels';
 import { VectorFormats } from '../vector/VectorFormats';
 import { GdalVectorReader } from '../vector/GdalVectorReader';
 import { BusinessOverlayManager, OverlayHit, OverlayKind } from './BusinessOverlayManager';
@@ -78,7 +79,7 @@ export class PickRouter {
   /** 轨迹叠加命中 */
   onTrackHit: (recordId: number) => void = (): void => {};
   /** 拍照点位命中 */
-  onMediaHit: (placemark: MediaPlacemark) => void = (): void => {};
+  onMediaHit: (placemark: PhotoRecord) => void = (): void => {};
   /** 样地点位命中 */
   onSurveyHit: (plotId: number) => void = (): void => {};
   /** 文件矢量要素命中：宿主弹详情层 */
@@ -167,12 +168,10 @@ export class FeaturePickController {
       return true;
     }
     if (h.kind === OverlayKind.MEDIA) {
-      MediaStore.getInstance(this.ctx).then(async (store: MediaStore): Promise<void> => {
-        const placemark: MediaPlacemark | undefined = await store.findPlacemark(h.recordId);
-        if (placemark !== undefined) {
-          this.router.onMediaHit(placemark);
-        }
-      });
+      const placemark: PhotoRecord | null = ProjectManager.get(this.ctx).findPhoto(h.recordId);
+      if (placemark !== null) {
+        this.router.onMediaHit(placemark);
+      }
       return true;
     }
     if (h.kind === OverlayKind.SURVEY) {

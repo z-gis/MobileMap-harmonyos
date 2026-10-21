@@ -7,7 +7,8 @@
 //
 // 分发规则（与 Android 一致）：
 //  · shp/kml/dwg/dxf/gpkg/geojson：拷入 layer 目录后直接引用（shp 附属文件同批拷入同名前缀子目录）；
-//  · zip：shp 压缩包 → 解压到 layer/<压缩包名>/ 后查找内部 shp；
+//  · zip：shp 压缩包 → 解压到临时目录后递归收集包内全部 shp，逐个连同附属文件整组搬平到
+//    layer/<压缩包名>/ 主目录（消除 zip 内无意义中间目录），多个 shp 全部导入；
 //  · kmz：解压后查找内部 kml（优先 doc.kml），显示名用压缩包本身文件名。
 // 解压：@ohos.zlib.decompressFile 支持 zip 族（kmz 即 zip），内部为 UTF-8 条目名，
 // 无需 Android 侧的 GBK 回退探测（鸿蒙 zlib 实现按 UTF-8 处理）。
@@ -41,6 +42,9 @@ const SIDE_CAR_SUFFIXES: string[] =
     '.ixs', '.mxs', '.atx', '.shp.xml', '.xml', '.qml', '.tfw', '.tzw', '.twx', '.ovr', '.rrd',
     '.aux.xml', '.hdr', '.xml'];
 
+/** zip 解压临时目录后缀（整组搬平到主目录后即删；同名残留下次导入先清再解） */
+const UNZIP_TMP_SUFFIX: string = '_unzip_tmp';
+
 export class VectorFileImporter {
   /**
    * 批量导入选择器返回的 URI 列表，返回成功导入的图层清单（失败的逐个 Toast 提示后跳过）。
@@ -71,23 +75,26 @@ export class VectorFileImporter {
         continue;
       }
       const rest: string[] = members.filter((u: string) => u !== main);
-      const one: ImportResult | null = await VectorFileImporter.importOne(main, rest);
-      if (one === null) {
+      const ones: ImportResult[] = await VectorFileImporter.importOne(main, rest);
+      if (ones.length === 0) {
         promptAction.showToast({ message: `导入失败：${names[i]}` });
         continue;
       }
-      results.push(one);
+      for (let j = 0; j < ones.length; j++) {
+        results.push(ones[j]);
+      }
     }
     return results;
   }
 
   /**
-   * 导入单个文件（主文件 + 可选附属文件 URI 列表）。失败返回 null，异常全部内部消化并记日志。
+   * 导入单个文件（主文件 + 可选附属文件 URI 列表），zip 内多个 shp 时逐个导入故返回列表。
+   * 失败返回空列表，异常全部内部消化并记日志。
    */
-  static async importOne(uri: string, sideCars: string[] = []): Promise<ImportResult | null> {
+  static async importOne(uri: string, sideCars: string[] = []): Promise<ImportResult[]> {
     const fileName: string = VectorFileImporter.fileNameOfUri(uri);
     if (fileName.length === 0) {
-      return null;
+      return [];
     }
     const ext: string = VectorFormats.extOf(fileName);
     const stem: string = AppDirs.deriveBaseName(fileName);
@@ -96,10 +103,11 @@ export class VectorFileImporter {
       if (VectorFormats.isArchive(uri)) {
         return await VectorFileImporter.importArchive(uri, stem, ext);
       }
-      return await VectorFileImporter.importPlain(uri, sideCars, fileName, stem);
+      const plain: ImportResult | null = await VectorFileImporter.importPlain(uri, sideCars, fileName, stem);
+      return plain === null ? [] : [plain];
     } catch (e) {
       AppLog.e(`导入失败: ${fileName}`, e);
-      return null;
+      return [];
     }
   }
 
@@ -137,26 +145,241 @@ export class VectorFileImporter {
     return new ImportResult(dest, stem);
   }
 
-  /** 压缩包：拷入 layer 目录 → 解压到 layer/<名>/ → 找主文件 */
+  /** 压缩包：拷入 layer 目录 → zip 走多 shp 整组搬平，kmz 走查找内部 kml */
   private static async importArchive(uri: string, stem: string,
-    ext: string): Promise<ImportResult | null> {
+    ext: string): Promise<ImportResult[]> {
     const destDir: string = AppDirs.ensureDir(AppDirs.dir(AppDirs.LAYER));
     const archivePath: string = `${destDir}/${AppDirs.sanitizeFileName(VectorFileImporter.fileNameOfUri(uri))}`;
     if (!VectorFileImporter.copyTo(uri, archivePath)) {
-      return null;
+      return [];
     }
     const outDir: string = `${destDir}/${AppDirs.sanitizeFileName(stem)}`;
-    if (!AppDirs.exists(outDir)) {
-      await zlib.decompressFile(archivePath, outDir);
+    try {
+      if (ext === 'kmz') {
+        const kmz: ImportResult | null = await VectorFileImporter.extractAndFindKml(archivePath, outDir, stem);
+        return kmz === null ? [] : [kmz];
+      }
+      return await VectorFileImporter.extractZipShapefiles(archivePath, outDir, stem);
+    } catch (e) {
+      AppLog.e(`解压压缩包失败: ${archivePath}`, e);
+      return [];
     }
-    const wantExts: string[] = ext === 'kmz' ? ['kml'] : ['shp'];
-    const target: string | null = VectorFileImporter.findInDir(outDir, wantExts);
+  }
+
+  /**
+   * shp 压缩包导入（同 Android extractZipShapefiles）：解压到临时目录后递归收集全部 shp
+   * （跳过 __MACOSX/隐藏文件等垃圾条目），每个 shp 连同同目录同名附属文件（dbf/shx/prj/cpg 等）
+   * 整组搬平到主目录，主目录已有同名 shp 时整组 stem 追加序号区分，搬完删除临时目录。
+   *
+   * 复用判定只看主目录**根级**是否已有 shp（既往已搬平）。
+   * 显示名：单个 shp 沿用压缩包名；多个 shp 各用自己的文件名。
+   */
+  private static async extractZipShapefiles(archivePath: string, destDir: string,
+    displayName: string): Promise<ImportResult[]> {
+    let shps: string[] = VectorFileImporter.rootShapefiles(destDir);
+    if (shps.length === 0) {
+      const tmpDir: string = `${destDir}${UNZIP_TMP_SUFFIX}`;
+      VectorFileImporter.removeDir(tmpDir);
+      await zlib.decompressFile(archivePath, tmpDir);
+      shps = VectorFileImporter.collectShapefiles(tmpDir);
+      for (let i = 0; i < shps.length; i++) {
+        VectorFileImporter.moveShapefileGroup(shps[i], destDir);
+      }
+      VectorFileImporter.removeDir(tmpDir);
+      shps = VectorFileImporter.rootShapefiles(destDir);
+    }
+    if (shps.length === 0) {
+      AppLog.w(`压缩包内未找到 shp 数据: ${archivePath}`);
+      return [];
+    }
+    const single: boolean = shps.length === 1;
+    const out: ImportResult[] = [];
+    for (let i = 0; i < shps.length; i++) {
+      const name: string = single ? displayName
+        : VectorFileImporter.stemOf(VectorFileImporter.fileNameOfUri(shps[i]));
+      out.push(new ImportResult(shps[i], name));
+    }
+    return out;
+  }
+
+  /** 主目录根级 shp 列表（不递归，复用判定与最终结果口径一致）；目录不存在返回空。 */
+  private static rootShapefiles(dir: string): string[] {
+    const out: string[] = [];
+    let names: string[] = [];
+    try {
+      names = fs.listFileSync(dir, { recursion: false });
+    } catch (e) {
+      return out;
+    }
+    for (let i = 0; i < names.length; i++) {
+      const full: string = `${dir}/${names[i]}`;
+      try {
+        if (fs.statSync(full).isFile() && VectorFormats.extOf(names[i]) === 'shp') {
+          out.push(full);
+        }
+      } catch (e) {
+        AppLog.w(`stat 失败，跳过 ${full}`);
+      }
+    }
+    return out;
+  }
+
+  /** 递归收集目录下全部 shp（跳过 __MACOSX/隐藏目录，过滤隐藏文件）。 */
+  private static collectShapefiles(dir: string): string[] {
+    const out: string[] = [];
+    VectorFileImporter.collectShapefilesInto(dir, out, 0);
+    return out;
+  }
+
+  private static collectShapefilesInto(dir: string, out: string[], depth: number): void {
+    if (depth > 6) {
+      return;
+    }
+    let names: string[] = [];
+    try {
+      names = fs.listFileSync(dir, { recursion: false });
+    } catch (e) {
+      return;
+    }
+    for (let i = 0; i < names.length; i++) {
+      const n: string = names[i];
+      if (n === '__MACOSX' || n.startsWith('.')) {
+        continue;
+      }
+      const full: string = `${dir}/${n}`;
+      try {
+        const stat: fs.Stat = fs.statSync(full);
+        if (stat.isDirectory()) {
+          VectorFileImporter.collectShapefilesInto(full, out, depth + 1);
+        } else if (stat.isFile() && VectorFormats.extOf(n) === 'shp') {
+          out.push(full);
+        }
+      } catch (e) {
+        AppLog.w(`stat 失败，跳过 ${full}`);
+      }
+    }
+  }
+
+  /**
+   * 把 shp 及其同目录全部同名附属文件（dbf/shx/prj/cpg 等，任意扩展名）整组搬到 destDir：
+   * 主目录已有同名 shp 时整组换 stem（<stem>_2 起），附属文件随组改名，保证 shp 依赖完整；
+   * rename 失败（跨目录等罕见情形）回退复制+删源。
+   */
+  private static moveShapefileGroup(shp: string, destDir: string): void {
+    AppDirs.ensureDir(destDir);
+    const slash: number = shp.lastIndexOf('/');
+    const sourceDir: string = shp.substring(0, slash);
+    const stem: string = VectorFileImporter.stemOf(shp.substring(slash + 1));
+    // 主目录同名 shp 冲突时整组换 stem（只比对 shp，不误判残留的孤立附属文件）
+    let targetStem: string = stem;
+    let seq: number = 2;
+    while (VectorFileImporter.hasShpNamed(destDir, targetStem)) {
+      targetStem = `${stem}_${seq}`;
+      seq++;
+    }
+    let names: string[] = [];
+    try {
+      names = fs.listFileSync(sourceDir, { recursion: false });
+    } catch (e) {
+      return;
+    }
+    for (let i = 0; i < names.length; i++) {
+      const n: string = names[i];
+      if (VectorFileImporter.stemOf(n) !== stem) {
+        continue;
+      }
+      const src: string = `${sourceDir}/${n}`;
+      try {
+        if (!fs.statSync(src).isFile()) {
+          continue;
+        }
+        const dot: number = n.lastIndexOf('.');
+        const ext: string = dot > 0 ? n.substring(dot + 1) : '';
+        const target: string = `${destDir}/${ext.length === 0 ? targetStem : `${targetStem}.${ext}`}`;
+        VectorFileImporter.moveFile(src, target);
+      } catch (e) {
+        AppLog.w(`附属文件搬运失败 ${src}`);
+      }
+    }
+  }
+
+  /** destDir 根级是否已有指定 stem 的 shp（扩展名大小写不敏感经 extOf 归一）。 */
+  private static hasShpNamed(dir: string, stem: string): boolean {
+    const roots: string[] = VectorFileImporter.rootShapefiles(dir);
+    for (let i = 0; i < roots.length; i++) {
+      const slash: number = roots[i].lastIndexOf('/');
+      if (VectorFileImporter.stemOf(roots[i].substring(slash + 1)) === stem) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  /** 单文件移动：优先 rename，失败回退复制+删源。 */
+  private static moveFile(src: string, dest: string): void {
+    try {
+      if (AppDirs.exists(dest)) {
+        fs.unlinkSync(dest);
+      }
+      fs.renameSync(src, dest);
+    } catch (e) {
+      try {
+        fs.copyFileSync(src, dest);
+        fs.unlinkSync(src);
+      } catch (e2) {
+        AppLog.w(`移动失败 ${src} -> ${dest}`);
+      }
+    }
+  }
+
+  /** 目录整体删除（不存在直接返回；内部失败仅记日志）。 */
+  private static removeDir(dir: string): void {
+    try {
+      if (AppDirs.exists(dir)) {
+        fs.rmdirSync(dir);
+      }
+    } catch (e) {
+      AppLog.w(`删除临时目录失败: ${dir}`);
+    }
+  }
+
+  /**
+   * kmz 专用（同 Android extractAndFind）：解压到 layer/<压缩包名(去扩展名)>/ 并查找内部 kml
+   * （优先 doc.kml）；displayName 为图层显示名（压缩包文件名）。
+   * 复用既有解压结果；目录缺失或存在但无目标内部文件时重新解压。
+   * 解压出的约定入口 doc.kml 重命名为与目录同名（<displayName>.kml），便于阅读与后续定位。
+   */
+  private static async extractAndFindKml(archivePath: string, destDir: string,
+    displayName: string): Promise<ImportResult | null> {
+    let target: string | null = AppDirs.exists(destDir) ? VectorFileImporter.findInDir(destDir, ['kml']) : null;
     if (target === null) {
-      AppLog.w(`压缩包内未找到 ${wantExts.join('/')}：${archivePath}`);
+      await zlib.decompressFile(archivePath, destDir);
+      target = VectorFileImporter.findInDir(destDir, ['kml']);
+    }
+    if (target === null) {
+      AppLog.w(`压缩包内未找到 kml 内部文件: ${archivePath}`);
       return null;
     }
-    // kmz 显示名用压缩包本身文件名，而非内部 doc.kml 的名称（与 Android 一致）
-    return new ImportResult(target, stem);
+    // kmz 入口 doc.kml 改名为与目录同名，消除无语义的 doc.kml（仅当位于解压根目录且名为 doc.kml 时处理）
+    const slash: number = target.lastIndexOf('/');
+    if (target.substring(slash + 1).toLowerCase() === 'doc.kml' && target.substring(0, slash) === destDir) {
+      const renamed: string = `${destDir}/${displayName}.kml`;
+      try {
+        if (!AppDirs.exists(renamed)) {
+          fs.renameSync(target, renamed);
+          target = renamed;
+        }
+      } catch (e) {
+        AppLog.w(`doc.kml 改名失败，沿用原名: ${target}`);
+      }
+    }
+    return new ImportResult(target, displayName);
+  }
+
+  /** 文件名去扩展名（只截最后一个点之后；点开头的隐藏文件保留整名）。 */
+  private static stemOf(fileName: string): string {
+    const dot: number = fileName.lastIndexOf('.');
+    return dot > 0 ? fileName.substring(0, dot) : fileName;
   }
 
   /** URI → 沙箱文件拷贝（覆盖式）；失败记日志返回 false */

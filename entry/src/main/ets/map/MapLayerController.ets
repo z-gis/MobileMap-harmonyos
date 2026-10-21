@@ -15,6 +15,7 @@ import { ColorHex } from '../common/ColorHex';
 import { MapStyle } from './MapStyle';
 import { StyleOverride, LayerInfo, MapDocument, MapSource } from '../doc/DocModels';
 import { DocumentManager } from '../doc/DocumentManager';
+import { TileCacheMigration } from './TileCacheMigration';
 import { FeatureIcons } from '../vector/FeatureIcons';
 import { GdalVectorReader } from '../vector/GdalVectorReader';
 import { VectorFormats, VectorReloadConfig } from '../vector/VectorFormats';
@@ -93,6 +94,9 @@ export class MapLayerController {
     if (doc === null) {
       return;
     }
+    // 启动批量迁移底图/注记旧目录瓦片缓存（对齐 Android migrateBaseTileCaches，先于逐源加层；
+    // 幂等 no-op，native 同步执行不 defer）。加层点迁移保留作兜底。
+    TileCacheMigration.migrateBaseTileCaches(doc);
     let index: number = 0;
     const bases: MapSource[] = doc.baseSources();
     for (let i = 0; i < bases.length; i++) {
@@ -311,7 +315,14 @@ export class MapLayerController {
         AppLog.w(`栅格文件不存在，跳过[${info.displayName()}]: ${path}`);
         continue;
       }
-      const idx: number = this.view.addRasterLayer(AppDirs.rasterTileDir(path), path);
+      // 瓦片缓存开关关闭时传空串：native TileCache baseDir 为空即不落盘（同 Android MapLayerManager 口径）；
+      // 开启时传单文件 MBTiles 路径（.mbtiles 结尾即走单文件 SQLite 后端），加层前先把旧目录缓存迁入（幂等兜底）
+      let cacheDir: string = '';
+      if (doc.systemConfig.rasterTileCacheEnabled) {
+        TileCacheMigration.migrateRasterTile(path);
+        cacheDir = AppDirs.rasterTileMbtiles(path);
+      }
+      const idx: number = this.view.addRasterLayer(cacheDir, path);
       if (idx >= 0) {
         this.rasterLayerIndices.set(path, idx);
       }
@@ -620,14 +631,25 @@ export class MapLayerController {
     return hex === undefined || hex.length === 0 ? fallback : hex;
   }
 
-  /** 装配一个瓦片图源：解析 URL 模板（Token 占位符替换）+ 磁盘缓存目录，按 overlay 标志加入 */
+  /**
+   * 装配一个瓦片图源：解析 URL 模板（Token 占位符替换）+ 磁盘缓存目录，按 overlay 标志加入。
+   * 离线开关（SystemConfig.tileOfflineOnly）打开时 URL 模板传空串——native 约定即「禁用联网、只读磁盘缓存瓦片」。
+   */
   private addTileSource(src: MapSource, overlay: boolean): void {
-    const urlTemplate: string = src.resolveUrl();
-    this.view.addTileLayer(AppDirs.baseTileDir(src.name ?? ''), urlTemplate, src.maxLevel, overlay);
-    AppLog.i(`图层[${src.name}] overlay=${overlay} 联网=${urlTemplate.length > 0} maxLevel=${src.maxLevel}`);
+    const offlineOnly: boolean = DocumentManager.getInstance().getConfig().tileOfflineOnly;
+    const urlTemplate: string = offlineOnly ? '' : src.resolveUrl();
+    // 单文件 MBTiles 缓存（.mbtiles 结尾即走引擎单文件 SQLite 后端）；加层前迁移旧目录缓存作兜底
+    // （启动批量迁移已跑过，此处幂等 no-op），native 打开即命中
+    const cacheFile: string = AppDirs.baseTileMbtiles(src.name ?? '');
+    TileCacheMigration.migrateBaseTile(src.name ?? '');
+    this.view.addTileLayer(cacheFile, urlTemplate, src.maxLevel, overlay);
+    AppLog.i(`图层[${src.name}] overlay=${overlay} 缓存文件=${cacheFile} 联网=${urlTemplate.length > 0} maxLevel=${src.maxLevel}`);
   }
 
-  /** 图源结构签名：各图源 sourceKey 有序拼接，任一图源增删改即变 */
+  /**
+   * 图源结构签名：各图源 sourceKey 有序拼接，任一图源增删改即变；
+   * 离线取瓦开关一并参入——翻转后签名变化交宿主重建瓦片层（缓存目录不变，已落盘瓦片直接命中）。
+   */
   static sourceSignature(doc: MapDocument | null): string {
     if (doc === null) {
       return '';
@@ -637,6 +659,7 @@ export class MapLayerController {
     for (let i = 0; i < list.length; i++) {
       parts.push(list[i].sourceKey());
     }
+    parts.push(doc.systemConfig.tileOfflineOnly ? '|offline=1' : '|offline=0');
     return parts.join(';');
   }
 
@@ -653,7 +676,7 @@ export class MapLayerController {
     return parts.join(';');
   }
 
-  /** 栅格层结构签名：各栅格层 path 有序拼接 */
+  /** 栅格层结构签名：各栅格层 path 有序拼接 + 瓦片缓存开关（翻转须整体重建换缓存模式） */
   static rasterSignature(doc: MapDocument | null): string {
     if (doc === null) {
       return '';
@@ -663,6 +686,7 @@ export class MapLayerController {
     for (let i = 0; i < list.length; i++) {
       parts.push(list[i].path ?? '');
     }
+    parts.push(doc.systemConfig.rasterTileCacheEnabled ? '|cache1' : '|cache0');
     return parts.join(';');
   }
 

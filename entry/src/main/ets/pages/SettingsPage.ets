@@ -7,6 +7,8 @@
 // 「帮助 / 关于」在 Android 是两行入口按钮，此处同样保持为两行可点条目。
 
 import { router } from '@kit.ArkUI';
+import { common } from '@kit.AbilityKit';
+import { BackgroundLocationController } from '../location/BackgroundLocationController';
 import { Theme } from '../common/Theme';
 import { MapDocument, SystemConfig } from '../doc/DocModels';
 import { DocumentManager } from '../doc/DocumentManager';
@@ -29,6 +31,8 @@ struct SettingsPage {
   @State viewMode3d: boolean = false;
   @State photoAddWatermark: boolean = true;
   @State backgroundLocation: boolean = false;
+  @State rasterTileCacheEnabled: boolean = true;
+  @State tileOfflineOnly: boolean = false;
 
   aboutToAppear(): void {
     const config: SystemConfig = DocumentManager.getInstance().getConfig();
@@ -42,6 +46,8 @@ struct SettingsPage {
     this.viewMode3d = config.viewMode3d;
     this.photoAddWatermark = config.photoAddWatermark;
     this.backgroundLocation = config.backgroundLocation;
+    this.rasterTileCacheEnabled = config.rasterTileCacheEnabled;
+    this.tileOfflineOnly = config.tileOfflineOnly;
   }
 
   /**
@@ -171,6 +177,34 @@ struct SettingsPage {
               this.backgroundLocation = v;
               this.applyConfig((c: SystemConfig): void => {
                 c.backgroundLocation = v;
+              });
+              // 开关切换即时同步保活门控（记录中开 / 记录外关，幂等）
+              BackgroundLocationController.onSettingChanged(getContext(this) as common.UIAbilityContext);
+            },
+          })
+          // 本地栅格瓦片磁盘缓存开关（性能对比测试用）：关闭后不落盘也不读盘，瓦片每次即时生成；
+          // 开关参入栅格结构签名，翻转后主界面重建栅格层即时生效
+          SwitchRow({
+            title: '本地栅格保存瓦片',
+            subtitle: '关闭后栅格瓦片不落盘，每次即时生成',
+            isOn: this.rasterTileCacheEnabled,
+            onSwitchChange: (v: boolean): void => {
+              this.rasterTileCacheEnabled = v;
+              this.applyConfig((c: SystemConfig): void => {
+                c.rasterTileCacheEnabled = v;
+              });
+            },
+          })
+          // 在线图源仅读离线缓存开关（无网络野外作业用）：打开后底图/注记不联网取瓦，只显示已落盘缓存瓦片；
+          // 开关参入图源结构签名，翻转后主界面重建瓦片层即时生效
+          SwitchRow({
+            title: '在线图源仅用离线瓦片',
+            subtitle: '打开后底图不联网，只显示已缓存的瓦片',
+            isOn: this.tileOfflineOnly,
+            onSwitchChange: (v: boolean): void => {
+              this.tileOfflineOnly = v;
+              this.applyConfig((c: SystemConfig): void => {
+                c.tileOfflineOnly = v;
               });
             },
           })

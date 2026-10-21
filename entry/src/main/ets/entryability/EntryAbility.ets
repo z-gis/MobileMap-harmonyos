@@ -16,6 +16,7 @@ import { AppDirs } from '../common/AppDirs';
 import { AppLog } from '../common/AppLog';
 import { SystemInsets } from '../common/SystemInsets';
 import { DocumentManager } from '../doc/DocumentManager';
+import { ProjectManager } from '../project/ProjectManager';
 
 const TAG: string = 'EntryAbility';
 
@@ -35,6 +36,13 @@ export default class EntryAbility extends UIAbility {
     NativeNet.initCaBundle(this.context);
     // 4) 地图工程文档
     DocumentManager.getInstance().loadOrCreate(this.context);
+    // 5) 工程模块预热：后台启动恢复/创建+旧库迁移；主地图页装配前会 await 同一 Promise
+    //    （Android 在 initializeAndSetup 后台线程做 ensureLoaded 后再 setupMapUi，此处等价提前起跑）
+    ProjectManager.get(this.context).ensureLoaded().then((): void => {
+      AppLog.i(`${TAG} 工程装载完成`);
+    }, (e: Error): void => {
+      AppLog.e('工程装载失败', `${e}`);
+    });
     AppLog.i(`${TAG} onCreate 初始化完成 ${Date.now() - t0}ms`);
   }
 

@@ -27,6 +27,8 @@ export struct MeasureDetailDialog {
   initialLineWidth: number = 3;
   onSave: (color: number, lineWidth: number) => void = (): void => {};
   onDelete: () => void = (): void => {};
+  /** 分享回调（仅轨迹详情传入；不传则分享键隐藏，同 Android onShare 可空口径） */
+  onShare: (() => void) | undefined = undefined;
 
   @State color: number = 0xFF57ACFD;
   @State lineWidth: number = 3;
@@ -166,6 +168,20 @@ export struct MeasureDetailDialog {
             this.onDelete();
             this.controller.close();
           })
+        if (this.onShare !== undefined) {
+          Button('分享')
+            .layoutWeight(1)
+            .height(38)
+            .fontSize(Theme.FONT)
+            .fontColor(Theme.TEXT_ON_DARK)
+            .backgroundColor(Theme.PRIMARY_DARK)
+            .onClick((): void => {
+              if (this.onShare !== undefined) {
+                this.onShare();
+              }
+              this.controller.close();
+            })
+        }
         Button('保存')
           .layoutWeight(1)
           .height(38)

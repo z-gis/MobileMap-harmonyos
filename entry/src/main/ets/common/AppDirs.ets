@@ -170,13 +170,16 @@ export class AppDirs {
   }
 
   /**
-   * 由数据文件名派生工程/缓存基础名（去扩展名并截断到安全长度）。
-   * 与 Android deriveBaseName 一致：'图斑.shp' → '图斑'。
+   * 由数据文件名派生工程/缓存基础名（去扩展名 + 文件名安全化）。
+   * 与 Android deriveBaseName 一致：只截掉最后一个点之后的扩展名（点开头的隐藏文件保留整名），
+   * trim 后空名回退 'sample'，保留中文名原样（仅替换文件系统保留字符），不做长度截断：
+   * '图斑.shp' → '图斑'。
    */
   static deriveBaseName(fileName: string): string {
     const dot = fileName.lastIndexOf('.');
     const stem = dot > 0 ? fileName.substring(0, dot) : fileName;
-    return stem.length > 60 ? stem.substring(0, 60) : stem;
+    const trimmed: string = stem.trim();
+    return AppDirs.sanitizeFileName(trimmed.length === 0 ? 'sample' : trimmed);
   }
 
   /**
@@ -210,6 +213,29 @@ export class AppDirs {
     const clean: string = AppDirs.sanitizeFileName(sourceName);
     const out = `${AppDirs.dir(AppDirs.TILES)}/${clean === 'unnamed' ? 'unknown' : clean}`;
     return AppDirs.ensureDir(out);
+  }
+
+  /**
+   * 底图/注记缓存单文件：tiles/<图源名净化>.mbtiles（引擎 TileCache 路径以 .mbtiles 结尾即走
+   * 单文件 SQLite 后端，对齐 Android tileCacheFile）。只确保父目录存在，文件由引擎/迁移按需创建。
+   */
+  static baseTileMbtiles(sourceName: string): string {
+    const clean: string = AppDirs.sanitizeFileName(sourceName);
+    const parent: string = AppDirs.ensureDir(AppDirs.dir(AppDirs.TILES));
+    return `${parent}/${clean === 'unnamed' ? 'unknown' : clean}.mbtiles`;
+  }
+
+  /**
+   * 栅格图层缓存单文件：tiles/raster/<栅格名净化>.mbtiles（栅格名=文件名去扩展名，
+   * 对齐 Android raster/<sanitizeDirName(rasterName)>.mbtiles）。只确保父目录存在。
+   */
+  static rasterTileMbtiles(path: string): string {
+    const fileName: string = path.substring(path.lastIndexOf('/') + 1);
+    const dot: number = fileName.lastIndexOf('.');
+    const stem: string = dot >= 0 ? fileName.substring(0, dot) : fileName;
+    const clean: string = AppDirs.sanitizeFileName(stem);
+    const parent: string = AppDirs.ensureDir(`${AppDirs.dir(AppDirs.TILES)}/raster`);
+    return `${parent}/${clean === 'unnamed' ? 'unknown' : clean}.mbtiles`;
   }
 
   /** Java String.hashCode（32 位有符号），保证与 Android 端缓存目录名可互认 */

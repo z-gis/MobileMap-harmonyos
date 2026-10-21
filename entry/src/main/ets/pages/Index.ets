@@ -26,10 +26,9 @@ import { Theme } from '../common/Theme';
 import { Ui } from '../common/Ui';
 import { MapDocument } from '../doc/DocModels';
 import { DocumentListener, DocumentManager } from '../doc/DocumentManager';
-import { MapDataStore, MeasurementRecord, TrackRecord } from '../db/MapDataStore';
+import { BackgroundLocationController } from '../location/BackgroundLocationController';
 import { LocationManager, LocationPoint } from '../location/LocationManager';
 import { MediaCaptureHelper } from '../media/MediaCaptureHelper';
-import { MediaGroup, MediaPlacemark, MediaStore } from '../media/MediaStore';
 import { BusinessOverlayManager } from '../map/BusinessOverlayManager';
 import { CameraNavigator, DEFAULT_LAT, DEFAULT_LON } from '../map/CameraNavigator';
 import { FeatureDetailRequest, FeaturePickController, PickRouter } from '../map/FeaturePickController';
@@ -40,8 +39,9 @@ import { MapStyle } from '../map/MapStyle';
 import { MeasureController, MeasureMode } from '../map/MeasureController';
 import { SqlQueryController } from '../map/SqlQueryController';
 import { TrackController } from '../map/TrackController';
-import { SampleSurveyStore } from '../survey/SampleSurveyStore';
-import { SurveyPlot } from '../survey/SurveyModels';
+import { ProjectManager } from '../project/ProjectManager';
+import { MeasureRecord, MediaGroupRecord, PhotoRecord, SurveyPlot, TrackRecord } from '../project/ProjectModels';
+import { TrackSharePackage } from '../track/TrackSharePackage';
 import { FeatureIcons } from '../vector/FeatureIcons';
 import { LayerManageParams, PhotoViewerParams, SurveyEditParams } from './RouteParams';
 
@@ -135,8 +135,8 @@ struct Index {
   private mediaDialog: CustomDialogController | undefined = undefined;
   /** 定位详情对话框（点底部定位文本弹出，对应 Android LocationDetailDialog.show） */
   private locDialog: CustomDialogController | undefined = undefined;
-  /** 拍照点位编辑对话框的分组下拉数据（打开前取库） */
-  private mediaGroups: MediaGroup[] = [];
+  /** 拍照点位编辑对话框的分组下拉数据（打开前取当前工程） */
+  private mediaGroups: MediaGroupRecord[] = [];
   private splashPoll: number = -1;
   /** 冷启动标志：仅首装配完成后挂加载门控，重建（图源/栅格结构变更）时跳过遮罩 */
   private coldStart: boolean = true;
@@ -164,6 +164,9 @@ struct Index {
   onPageShow(): void {
     // 外部导入图层返回：缩放到新图层四至（Android ExternalImportHandler 的页面化等价）
     this.consumeImportedLayer();
+    // 工程管理页打开/新建工程返回：清交接槽（数据签名已变，下面 overlays.rebuild 统一刷新，
+    // 对齐 Android ProjectManageDialog 回调只重建叠加层）
+    PageData.take(PageKeys.PROJECT_CHANGED);
     const nav: CameraNavigator | undefined = this.navigator;
     const overlays: BusinessOverlayManager | undefined = this.overlays;
     if (nav === undefined || overlays === undefined) {
@@ -306,6 +309,8 @@ struct Index {
       // 轨迹开始/恢复记录自动锁定跟随、停止记录自动解锁还原（Android MainActivity 同一接线；
       // 暂停不改 recording 故不解锁，setFollowEnabled 幂等判重）
       location.setFollowEnabled(recording);
+      // 后台定位保活门控：记录中且开关为开时申请 location 长时任务，停止记录即刻释放（幂等）
+      BackgroundLocationController.onTrackRecordingChanged(ctx, recording);
     };
     location.onLocationText = (text: string): void => {
       this.locationText = text;
@@ -319,7 +324,7 @@ struct Index {
     capture.onMediaChanged = (): void => {
       overlays.rebuild();
     };
-    capture.onEditSession = (placemark: MediaPlacemark): void => {
+    capture.onEditSession = (placemark: PhotoRecord): void => {
       this.openMediaEdit(placemark, ctx);
     };
     this.bindPickRouter(pickRouter, ctx);
@@ -364,6 +369,11 @@ struct Index {
     t = Date.now();
     layers.syncVectorLayers(doc);
     AppLog.i(`${TAG} 矢量层装配 ${Date.now() - t}ms`);
+    // 工程装载（含首启旧库迁移）必须先于首轮叠加层重建：叠加层读的是当前工程数据
+    // （Android 在 setupMapUi 前 ensureLoaded；EntryAbility 已预热，此处 await 同一 Promise）
+    t = Date.now();
+    await ProjectManager.get(ctx).ensureLoaded();
+    AppLog.i(`${TAG} 工程装载 ${Date.now() - t}ms`);
     t = Date.now();
     await overlays.rebuild();
     AppLog.i(`${TAG} 叠加层重建 ${Date.now() - t}ms`);
@@ -445,50 +455,37 @@ struct Index {
    */
   private bindPickRouter(pickRouter: PickRouter, ctx: common.UIAbilityContext): void {
     pickRouter.onMeasureHit = (recordId: number): void => {
-      MapDataStore.getInstance(ctx).then(async (store: MapDataStore): Promise<void> => {
-        const records: MeasurementRecord[] = await store.loadMeasurements();
-        const hit: MeasurementRecord | undefined = Index.findMeasurement(records, recordId);
-        // 记录可能已被外部删除：取不到即静默忽略
-        if (hit !== undefined) {
-          this.openMeasureDetail(hit, store);
-        }
-      }, (e: Error): void => {
-        AppLog.e('读测量记录失败', `${e}`);
-      });
+      // 记录可能已被外部删除：取不到即静默忽略
+      const hit: MeasureRecord | null = ProjectManager.get(ctx).findMeasure(recordId);
+      if (hit !== null) {
+        this.openMeasureDetail(hit, ctx);
+      }
     };
     pickRouter.onTrackHit = (recordId: number): void => {
-      MapDataStore.getInstance(ctx).then(async (store: MapDataStore): Promise<void> => {
-        const hit: TrackRecord | undefined = await store.findTrack(recordId);
-        if (hit !== undefined) {
-          this.openTrackDetail(hit, store);
-        }
-      }, (e: Error): void => {
-        AppLog.e('读轨迹记录失败', `${e}`);
-      });
+      const hit: TrackRecord | null = ProjectManager.get(ctx).findTrack(recordId);
+      if (hit !== null) {
+        this.openTrackDetail(hit, ctx);
+      }
     };
-    pickRouter.onMediaHit = (placemark: MediaPlacemark): void => {
+    pickRouter.onMediaHit = (placemark: PhotoRecord): void => {
       const params: PhotoViewerParams = new PhotoViewerParams();
       params.placemarkId = placemark.id;
       params.initialIndex = 0;
       router.pushUrl({ url: 'pages/PhotoViewerPage', params: params });
     };
     pickRouter.onSurveyHit = (plotId: number): void => {
-      SampleSurveyStore.getInstance(ctx).then(async (store: SampleSurveyStore): Promise<void> => {
-        const plot: SurveyPlot | undefined = await store.loadPlot(plotId);
-        if (plot === undefined) {
-          return;
-        }
-        const params: SurveyEditParams = new SurveyEditParams();
-        params.sourcePath = plot.sourcePath;
-        params.sourceFid = plot.sourceFid;
-        params.compartmentNo = plot.compartmentNo;
-        params.centerLat = plot.centerLatitude;
-        params.centerLon = plot.centerLongitude;
-        params.plotId = plot.id;
-        router.pushUrl({ url: 'pages/SurveyEditPage', params: params });
-      }, (e: Error): void => {
-        AppLog.e('读样地记录失败', `${e}`);
-      });
+      const plot: SurveyPlot | null = ProjectManager.get(ctx).findSurveyPlot(plotId);
+      if (plot === null) {
+        return;
+      }
+      const params: SurveyEditParams = new SurveyEditParams();
+      params.sourcePath = plot.sourcePath;
+      params.sourceFid = plot.sourceFid;
+      params.compartmentNo = plot.compartmentNo;
+      params.centerLat = plot.centerLatitude;
+      params.centerLon = plot.centerLongitude;
+      params.plotId = plot.id;
+      router.pushUrl({ url: 'pages/SurveyEditPage', params: params });
     };
     pickRouter.onFeatureDetail = (req: FeatureDetailRequest): void => {
       PageData.put(PageKeys.FEATURE_DETAIL, req);
@@ -501,29 +498,20 @@ struct Index {
     };
   }
 
-  private static findMeasurement(records: MeasurementRecord[], id: number): MeasurementRecord | undefined {
-    for (let i = 0; i < records.length; i++) {
-      if (records[i].id === id) {
-        return records[i];
-      }
-    }
-    return undefined;
-  }
-
   // ── 弹层：测量 / 轨迹 / 拍照点位 / 移动到 ──────────────────────────
 
   /** 测量详情（Android MeasureCaptureController.showMeasureDetail 等价） */
-  private openMeasureDetail(record: MeasurementRecord, store: MapDataStore): void {
+  private openMeasureDetail(record: MeasureRecord, ctx: common.UIAbilityContext): void {
     this.measureDialog = new CustomDialogController({
       builder: MeasureDetailDialog({
         title: record.name,
         typeText: MeasureController.typeDisplayName(record.type),
         geometryText: MeasureController.geometryText(record),
-        widthEditable: record.type !== MeasurementRecord.TYPE_POINT,
-        initialColor: record.color,
+        widthEditable: record.type !== MeasureRecord.TYPE_POINT,
+        initialColor: ProjectManager.parseColor(record.color, Index.defaultColorForMeasureType(record.type)),
         initialLineWidth: record.lineWidth,
         onSave: (color: number, lineWidth: number): void => {
-          store.updateMeasurementStyle(record.id, color, lineWidth).then((): void => {
+          ProjectManager.get(ctx).updateMeasureStyle(record.id, color, lineWidth).then((): void => {
             this.rebuildOverlays();
             Ui.toast('样式已更新');
           }, (e: Error): void => {
@@ -531,7 +519,7 @@ struct Index {
           });
         },
         onDelete: (): void => {
-          this.confirmDeleteMeasurement(record, store);
+          this.confirmDeleteMeasurement(record, ctx);
         },
       }),
       customStyle: true,
@@ -542,17 +530,17 @@ struct Index {
   }
 
   /** 轨迹详情（Android TrackCaptureController.showTrackDetail 复用同一对话框） */
-  private openTrackDetail(record: TrackRecord, store: MapDataStore): void {
+  private openTrackDetail(record: TrackRecord, ctx: common.UIAbilityContext): void {
     this.measureDialog = new CustomDialogController({
       builder: MeasureDetailDialog({
         title: record.name,
         typeText: '轨迹',
         geometryText: TrackController.geometryText(record),
         widthEditable: true,
-        initialColor: record.color,
+        initialColor: ProjectManager.parseColor(record.color, 0xFF33CCFF),
         initialLineWidth: record.lineWidth,
         onSave: (color: number, lineWidth: number): void => {
-          store.updateTrackStyle(record.id, color, lineWidth).then((): void => {
+          ProjectManager.get(ctx).updateTrackStyle(record.id, color, lineWidth).then((): void => {
             this.rebuildOverlays();
             Ui.toast('样式已更新');
           }, (e: Error): void => {
@@ -560,7 +548,11 @@ struct Index {
           });
         },
         onDelete: (): void => {
-          this.confirmDeleteTrack(record, store);
+          this.confirmDeleteTrack(record, ctx);
+        },
+        // 分享按导出 shp 数据包（折线 + WGS84，见 track/TrackSharePackage）经系统分享面板发出
+        onShare: (): void => {
+          TrackSharePackage.shareTrack(ctx, record);
         },
       }),
       customStyle: true,
@@ -570,12 +562,23 @@ struct Index {
     this.measureDialog.open();
   }
 
-  private confirmDeleteMeasurement(record: MeasurementRecord, store: MapDataStore): void {
+  /** 测量类型默认色（记录未设色时对话框初值，对齐 Android defaultColorForType） */
+  private static defaultColorForMeasureType(type: string): number {
+    if (type === MeasureRecord.TYPE_AREA) {
+      return MapStyle.MEASURE_COLOR_AREA;
+    }
+    if (type === MeasureRecord.TYPE_POINT) {
+      return MapStyle.MEASURE_COLOR_POINT;
+    }
+    return MapStyle.MEASURE_COLOR_DISTANCE;
+  }
+
+  private confirmDeleteMeasurement(record: MeasureRecord, ctx: common.UIAbilityContext): void {
     Ui.confirm('删除确认', `确定删除测量数据：${record.name} ？`, '删除').then((ok: boolean): void => {
       if (!ok) {
         return;
       }
-      store.deleteMeasurement(record.id).then((): void => {
+      ProjectManager.get(ctx).removeMeasure(record.id).then((): void => {
         this.rebuildOverlays();
         Ui.toast('已删除');
       }, (e: Error): void => {
@@ -584,13 +587,13 @@ struct Index {
     });
   }
 
-  private confirmDeleteTrack(record: TrackRecord, store: MapDataStore): void {
+  private confirmDeleteTrack(record: TrackRecord, ctx: common.UIAbilityContext): void {
     Ui.confirm('删除确认', `确定删除轨迹：${record.name} ？删除后该轨迹及其全部坐标点将一并删除。`,
       '删除').then((ok: boolean): void => {
         if (!ok) {
           return;
         }
-        store.deleteTrack(record.id).then((): void => {
+        ProjectManager.get(ctx).removeTrack(record.id).then((): void => {
           this.rebuildOverlays();
           Ui.toast('已删除');
         }, (e: Error): void => {
@@ -600,50 +603,47 @@ struct Index {
   }
 
   /** 拍照会话完成后的「名称 + 分组」编辑面板（Android MediaEditDialog 等价） */
-  private openMediaEdit(placemark: MediaPlacemark, ctx: common.UIAbilityContext): void {
-    MediaStore.getInstance(ctx).then(async (store: MediaStore): Promise<void> => {
-      this.mediaGroups = await store.loadGroups();
-      this.mediaDialog = new CustomDialogController({
-        builder: MediaEditDialog({
-          placemark: placemark,
-          groups: this.mediaGroups,
-          onConfirmEdit: (name: string, groupId: number, newGroupName: string): void => {
-            this.applyMediaEdit(store, placemark.id, name, groupId, newGroupName);
-          },
-        }),
-        customStyle: true,
-        alignment: DialogAlignment.Center,
-        autoCancel: true,
-      });
-      this.mediaDialog.open();
-    }, (e: Error): void => {
-      AppLog.e('读拍照分组失败', `${e}`);
+  private openMediaEdit(placemark: PhotoRecord, ctx: common.UIAbilityContext): void {
+    this.mediaGroups = ProjectManager.get(ctx).listGroups();
+    this.mediaDialog = new CustomDialogController({
+      builder: MediaEditDialog({
+        placemark: placemark,
+        groups: this.mediaGroups,
+        onConfirmEdit: (name: string, groupId: number, newGroupName: string): void => {
+          this.applyMediaEdit(ctx, placemark.id, name, groupId, newGroupName);
+        },
+      }),
+      customStyle: true,
+      alignment: DialogAlignment.Center,
+      autoCancel: true,
     });
+    this.mediaDialog.open();
   }
 
   /** 新建分组要先落库拿到主键，再把点位改到该组（与 PhotoPage.applyEdit 同编排） */
-  private applyMediaEdit(store: MediaStore, placemarkId: number, name: string,
+  private applyMediaEdit(ctx: common.UIAbilityContext, placemarkId: number, name: string,
     groupId: number, newGroupName: string): void {
-    this.saveMediaEdit(store, placemarkId, name, groupId, newGroupName).then((): void => {
+    this.saveMediaEdit(ctx, placemarkId, name, groupId, newGroupName).then((): void => {
       this.rebuildOverlays();
     }, (e: Error): void => {
       AppLog.e('保存拍照点位失败', `${e}`);
     });
   }
 
-  private async saveMediaEdit(store: MediaStore, placemarkId: number, name: string,
+  private async saveMediaEdit(ctx: common.UIAbilityContext, placemarkId: number, name: string,
     groupId: number, newGroupName: string): Promise<void> {
+    const pm: ProjectManager = ProjectManager.get(ctx);
     let target: number = groupId;
     if (newGroupName.length > 0) {
-      const created: number = await store.insertGroup(newGroupName, Date.now());
+      const created: number = await pm.addGroup(newGroupName, Date.now());
       if (created < 0) {
         Ui.toast('新建分组失败');
         return;
       }
       target = created;
     }
-    await store.updatePlacemarkName(placemarkId, name);
-    await store.updatePlacemarkGroup(placemarkId, target);
+    await pm.updatePhotoName(placemarkId, name);
+    await pm.updatePhotoGroup(placemarkId, target);
     Ui.toast('已保存');
   }
 
@@ -952,7 +952,7 @@ struct Index {
           .layoutWeight(1)
           .hitTestBehavior(HitTestMode.None)
 
-        // 右栏：图层 → 拍照 → 注记 / 缩放面板
+        // 右栏：图层 → 工程 → 拍照 → 注记 / 缩放面板
         Column() {
           MapIconButton({
             label: '图层',
@@ -962,6 +962,14 @@ struct Index {
               router.pushUrl({ url: 'pages/LayerManagePage', params: params });
             },
           })
+          // 工程管理入口（0.4.0.0 工程模块，对齐 Android jni_map_project：右栏图层键正下方）
+          MapIconButton({
+            label: '工程',
+            action: (): void => {
+              router.pushUrl({ url: 'pages/ProjectManagePage' });
+            },
+          })
+            .margin({ top: 5 })
           Column()
             .layoutWeight(7)
             .hitTestBehavior(HitTestMode.None)

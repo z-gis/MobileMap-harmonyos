@@ -11,6 +11,7 @@
 //  · 「无该项信息」判定：Android 用 hasAltitude()/hasAccuracy() 等，鸿蒙侧已由 LocationManager 归一为 NaN / 负值。
 
 import { pasteboard } from '@kit.BasicServicesKit';
+import { common } from '@kit.AbilityKit';
 import { CoordFormatter } from '../common/Coord';
 import { AppLog } from '../common/AppLog';
 import { Theme } from '../common/Theme';
@@ -18,6 +19,7 @@ import { TimeText } from '../common/TimeText';
 import { Ui } from '../common/Ui';
 import { MapDocument, SystemConfig } from '../doc/DocModels';
 import { DocumentManager } from '../doc/DocumentManager';
+import { BackgroundLocationController } from '../location/BackgroundLocationController';
 import { LocationManager, LocationPoint, SatelliteInfo } from '../location/LocationManager';
 
 /** 无信息占位符（Android LocationDetailDialog.NONE 同值） */
@@ -124,6 +126,8 @@ export struct LocationDetailDialog {
       const config: SystemConfig = doc.systemConfig;
       config.backgroundLocation = v;
     });
+    // 开关切换即时同步保活门控（记录中开 / 记录外关，幂等）
+    BackgroundLocationController.onSettingChanged(getContext(this) as common.UIAbilityContext);
   }
 
   /** 复制 WGS84 经纬度（十进制度 6 位小数，经度在前）到系统剪贴板 */

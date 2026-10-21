@@ -3,7 +3,7 @@
 // 与 Android 的结构差异：ListView + BaseAdapter 手工同步（syncRowsFromViews）在 ArkUI 不需要 ——
 // 明细行直接 ForEach 到 List，控件值改动即时写回 SurveyRow 模型，保存时整体落库。
 // 口径保持一致的三处：
-//   1) plotId>0 走 loadPlot，否则 createDraftPlot（编号占位、不入库）；
+//   1) plotId>0 走 ProjectManager.findSurveyPlot，否则新建本地草稿（编号占位、不入库）；
 //   2) GPS 行优先取实时定位，且仅在草稿中心为 NaN 时回填（已有记录不覆盖历史中心）；
 //   3) 删除明细行后重排序号。
 // 角点坐标 cornerCoordinates 与 Android 同样保留为空串（该字段由四角仪手工录入的业务另做处理，界面无输入项）。
@@ -13,12 +13,16 @@ import { router } from '@kit.ArkUI';
 import { Theme } from '../common/Theme';
 import { Ui } from '../common/Ui';
 import { LocationChangedListener, LocationManager, LocationPoint } from '../location/LocationManager';
-import { SampleSurveyStore } from '../survey/SampleSurveyStore';
-import { SampleSurveyConfig, SurveyPlot, SurveyRow } from '../survey/SurveyModels';
+import { SampleSurveyConfig } from '../survey/SurveyModels';
+import { ProjectManager } from '../project/ProjectManager';
+import { SurveyPlot, SurveyRow } from '../project/ProjectModels';
 import { TitleBar } from '../components/TitleBar';
 import { SurveyEditParams } from './RouteParams';
 
-/** 新增行的界面标识递减负数（与已入库行的正数 id 天然区分，见 SurveyRow.uid 注释） */
+/**
+ * 新增行的界面标识递减负数（与已入库行的正数 id 天然区分）。
+ * ProjectModels.SurveyRow 无 uid 字段：ForEach 键由页内与 rows 平行的 rowKeys 数组承载。
+ */
 const NEW_ROW_UID_START: number = -1;
 /** 郁闭度合法区间（超出仅提示不强改，允许现场录入习惯差异） */
 const DENSITY_MAX: number = 1.0;
@@ -43,6 +47,8 @@ struct SurveyEditPage {
   private centerLon: number = Number.NaN;
   private plotId: number = -1;
   private newRowUid: number = NEW_ROW_UID_START;
+  /** 与 rows 平行的 ForEach 键（已入库行用正 id，新增行用递减负数） */
+  private rowKeys: number[] = [];
   private readonly onLocation: LocationChangedListener = (loc: LocationPoint): void => {
     this.applyLocation(loc);
   };
@@ -72,21 +78,42 @@ struct SurveyEditPage {
     return this.getUIContext().getHostContext() as common.UIAbilityContext;
   }
 
-  private async loadPlot(): Promise<void> {
-    const store: SampleSurveyStore = await SampleSurveyStore.getInstance(this.context());
-    let plot: SurveyPlot | undefined = undefined;
+  private loadPlot(): void {
+    const pm: ProjectManager = ProjectManager.get(this.context());
+    let plot: SurveyPlot | null = null;
     if (this.plotId > 0) {
-      plot = await store.loadPlot(this.plotId);
+      plot = pm.findSurveyPlot(this.plotId);
     }
-    if (plot === undefined) {
-      plot = await store.createDraftPlot(this.sourcePath, this.sourceFid, this.compartmentNo,
-        '', this.centerLat, this.centerLon);
+    if (plot === null) {
+      // 新建本地草稿（对齐 Android：未持久化 id=0，编号取同小班内下一个，保存时才入库）
+      const draft: SurveyPlot = new SurveyPlot();
+      draft.sourcePath = this.sourcePath.trim();
+      draft.sourceFid = this.sourceFid;
+      draft.compartmentNo = this.compartmentNo.trim();
+      draft.plotNo = pm.nextSurveyPlotNo(this.sourcePath, this.sourceFid);
+      draft.cornerCoordinates = '';
+      const now: number = Date.now();
+      draft.createdAt = now;
+      draft.updatedAt = now;
+      if (Number.isFinite(this.centerLat) && Number.isFinite(this.centerLon)) {
+        draft.setCenter(this.centerLat, this.centerLon);
+      }
+      plot = draft;
     }
     this.plot = plot;
     this.plotNo = plot.plotNo;
     this.treeHeight = plot.averageTreeHeight;
     this.canopyDensity = Number.isNaN(plot.canopyDensity) ? '' : Ui.num(plot.canopyDensity, 2);
     this.rows = plot.rows;
+    // ForEach 键初始化：已入库行用正 id，无 id 行用递减负数
+    this.rowKeys = [];
+    for (let i = 0; i < this.rows.length; i++) {
+      const key: number = this.rows[i].id > 0 ? this.rows[i].id : this.newRowUid;
+      if (this.rows[i].id <= 0) {
+        this.newRowUid -= 1;
+      }
+      this.rowKeys.push(key);
+    }
     this.applyLocation(LocationManager.getInstance().getLastLocation());
   }
 
@@ -95,13 +122,9 @@ struct SurveyEditPage {
     if (loc !== null) {
       this.gpsText = `${Ui.fixed(loc.longitude, 6)}, ${Ui.fixed(loc.latitude, 6)}`;
       const plot: SurveyPlot | undefined = this.plot;
-      if (plot !== undefined) {
-        if (Number.isNaN(plot.centerLatitude)) {
-          plot.centerLatitude = loc.latitude;
-        }
-        if (Number.isNaN(plot.centerLongitude)) {
-          plot.centerLongitude = loc.longitude;
-        }
+      if (plot !== undefined && (Number.isNaN(plot.centerLatitude) || Number.isNaN(plot.centerLongitude))) {
+        // centerLatitude/centerLongitude 为只读 getter，回填统一走 setCenter
+        plot.setCenter(loc.latitude, loc.longitude);
       }
       return;
     }
@@ -112,12 +135,12 @@ struct SurveyEditPage {
 
   private addRow(): void {
     const row: SurveyRow = new SurveyRow();
-    row.uid = this.newRowUid;
-    this.newRowUid -= 1;
     row.sortNo = this.rows.length;
     row.treeSpecies = SampleSurveyConfig.TREE_SPECIES[0];
     row.category = SampleSurveyConfig.CATEGORIES[0];
     row.thinningMethod = SampleSurveyConfig.THINNING_METHODS[0];
+    this.rowKeys.push(this.newRowUid);
+    this.newRowUid -= 1;
     // 重新赋值数组触发 ForEach 增量渲染（行内字段改动无需渲染，控件自持文本态）
     this.rows = this.rows.concat([row]);
   }
@@ -128,6 +151,7 @@ struct SurveyEditPage {
     }
     const next: SurveyRow[] = this.rows.slice();
     next.splice(index, 1);
+    this.rowKeys.splice(index, 1);
     // 删行后序号连续（与 Android rows.forEachIndexed { idx, r -> r.sortNo = idx + 1 } 同口径）
     for (let i = 0; i < next.length; i++) {
       next[i].sortNo = i;
@@ -147,16 +171,15 @@ struct SurveyEditPage {
       Ui.toastLong(`郁闭度通常在 0~${DENSITY_MAX} 之间，已按 ${Ui.num(density, 2)} 保存`);
     }
     this.saving = true;
-    const store: SampleSurveyStore = await SampleSurveyStore.getInstance(this.context());
-    const saved: SurveyPlot | undefined = await store.savePlot(plot, this.rows);
+    // 明细行全量替换后整体保存（对齐 Android saveSurvey 语义）
+    plot.rows = this.rows;
+    const saved: SurveyPlot | null = await ProjectManager.get(this.context()).saveSurveyPlot(plot);
     this.saving = false;
-    if (saved === undefined) {
+    if (saved === null) {
       Ui.toast('保存失败');
       return;
     }
     this.plot = saved;
-    // 保存成功后明细行 id 已被重写，同步 uid 以免返回本页时行错位
-    this.rows = saved.rows;
     Ui.toast('样地调查已保存');
     router.back();
   }
@@ -178,7 +201,7 @@ struct SurveyEditPage {
           this.rowHeader()
           ForEach(this.rows, (row: SurveyRow, index: number): void => {
             this.rowCard(row, index)
-          }, (row: SurveyRow): string => `${row.uid}`)
+          }, (row: SurveyRow, index: number): string => `${this.rowKeys[index]}`)
           Button('+ 添加一行')
             .width('100%')
             .height(40)

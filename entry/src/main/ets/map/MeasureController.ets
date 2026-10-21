@@ -13,7 +13,8 @@ import { NativeMapView, VectorStyle } from '@zys/globecore';
 import { GeoCalc, LatLng } from '../common/GeoCalc';
 import { AppLog } from '../common/AppLog';
 import { Ui } from '../common/Ui';
-import { MapDataStore, MeasurementRecord } from '../db/MapDataStore';
+import { ProjectManager } from '../project/ProjectManager';
+import { MeasureRecord } from '../project/ProjectModels';
 import { BusinessOverlayManager, MeasureLabelAnchors, MeasureLabels } from './BusinessOverlayManager';
 import { MapStyle } from './MapStyle';
 
@@ -219,7 +220,7 @@ export class MeasureController {
       }
       this.view.updateOverlayLines(idx, BusinessOverlayManager.flattenLonLat(this.points),
         [this.points.length], [0], []);
-      this.updateLiveLabels(MeasurementRecord.TYPE_DISTANCE, this.points);
+      this.updateLiveLabels(MeasureRecord.TYPE_DISTANCE, this.points);
       return;
     }
     if (this.mode === MeasureMode.AREA) {
@@ -232,7 +233,7 @@ export class MeasureController {
         // 2 点：先画开链折线给出「连线」反馈，标注层显示该边边长
         this.view.updateOverlayLines(idx, BusinessOverlayManager.flattenLonLat(this.points),
           [2], [0], []);
-        this.updateLiveLabels(MeasurementRecord.TYPE_AREA, this.points);
+        this.updateLiveLabels(MeasureRecord.TYPE_AREA, this.points);
         return;
       }
       const ring: Point[] = [];
@@ -242,7 +243,7 @@ export class MeasureController {
       ring.push(this.points[0]);
       this.view.updateOverlayPolygons(idx, BusinessOverlayManager.flattenLonLat(ring),
         [ring.length], [1], [0], []);
-      this.updateLiveLabels(MeasurementRecord.TYPE_AREA, this.points);
+      this.updateLiveLabels(MeasureRecord.TYPE_AREA, this.points);
     }
   }
 
@@ -303,9 +304,9 @@ export class MeasureController {
       Ui.toast('至少需要三个点');
       return false;
     }
-    const type: string = this.mode === MeasureMode.POINT ? MeasurementRecord.TYPE_POINT
-      : (this.mode === MeasureMode.AREA ? MeasurementRecord.TYPE_AREA
-        : MeasurementRecord.TYPE_DISTANCE);
+    const type: string = this.mode === MeasureMode.POINT ? MeasureRecord.TYPE_POINT
+      : (this.mode === MeasureMode.AREA ? MeasureRecord.TYPE_AREA
+        : MeasureRecord.TYPE_DISTANCE);
     const now: number = Date.now();
     const name: string = Ui.stampName(MeasureController.modeDisplayName(this.mode), now);
     const points: Point[] = [];
@@ -313,10 +314,11 @@ export class MeasureController {
       const p: Point = this.points[i];
       points.push([p[0], p[1], p.length > 2 ? p[2] : 0]);
     }
-    const store: MapDataStore = await MapDataStore.getInstance(this.ctx);
-    const id: number = await store.addMeasurement(name, type,
+    const pm: ProjectManager = ProjectManager.get(this.ctx);
+    const id: number = await pm.addMeasure(name, type,
       MeasureController.defaultColorForMode(this.mode), now, points);
     if (id >= 0) {
+      await pm.saveNow(); // 定型写入立即落盘，不依赖防抖窗口
       Ui.toast('测量已保存');
     }
     this.exit();
@@ -346,13 +348,13 @@ export class MeasureController {
   // ── 详情展示辅助（页面对话框复用）──────────────────────────────────
 
   static typeDisplayName(type: string): string {
-    if (type === MeasurementRecord.TYPE_POINT) {
+    if (type === MeasureRecord.TYPE_POINT) {
       return '点位测量';
     }
-    if (type === MeasurementRecord.TYPE_DISTANCE) {
+    if (type === MeasureRecord.TYPE_DISTANCE) {
       return '距离测量';
     }
-    if (type === MeasurementRecord.TYPE_AREA) {
+    if (type === MeasureRecord.TYPE_AREA) {
       return '面积测量';
     }
     return '测量';
@@ -372,16 +374,16 @@ export class MeasureController {
   }
 
   /** 几何量算文本：点=坐标，距离=总长，面积=面积 + 周长 */
-  static geometryText(record: MeasurementRecord): string {
+  static geometryText(record: MeasureRecord): string {
     const pts: Point[] = record.points;
     if (pts.length === 0) {
       return '';
     }
-    if (record.type === MeasurementRecord.TYPE_POINT) {
+    if (record.type === MeasureRecord.TYPE_POINT) {
       return `坐标: ${pts[0][0].toFixed(6)}, ${pts[0][1].toFixed(6)}`;
     }
     const degrees: LatLng[] = MeasureController.toLatLng(pts);
-    if (record.type === MeasurementRecord.TYPE_DISTANCE) {
+    if (record.type === MeasureRecord.TYPE_DISTANCE) {
       return `距离: ${GeoCalc.formatDistance(GeoCalc.polylineLengthMeters(degrees))}`;
     }
     if (pts.length < 3) {

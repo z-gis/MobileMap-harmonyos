@@ -1,8 +1,8 @@
-// BusinessOverlayManager.ets —— 业务叠加层显示与命中映射（对应 Android ui.map.BusinessOverlayManager）。
+// BusinessOverlayManager.ets —— 业务叠加层显示与命中映射（对应 Android ui.map.BusinessOverlayManager，0.4.0.4 工程版）。
 //
-// 测量 / 轨迹 / 拍照 / 样地四类业务数据存于关系库（非 document.json），经内核动态叠加层渲染：
+// 测量 / 轨迹 / 拍照 / 样地四类业务数据存于当前工程 gpkg（ProjectManager 内存模型），经内核动态叠加层渲染：
 //  · 数据签名判定：仅当「记录摘要 + 可见性开关」变化才 clearOverlayLayers 重建，避免每次文档变更无谓重建；
-//  · 命中映射：重建时记录「叠加层索引 → 业务主键」，拾取命中据此分流到对应详情（DB 读取交宿主）；
+//  · 命中映射：重建时记录「叠加层索引 → 业务主键」，拾取命中据此分流到对应详情（记录读取交宿主）；
 //  · 采集态门控：测量/轨迹采集中跳过重建（clearOverlayLayers 会清掉 live 层）。
 // 内核索引口径：叠加层与文件矢量层共享索引空间，clearOverlayLayers 后叠加层索引重置，映射须随重建刷新。
 
@@ -11,12 +11,10 @@ import { NativeMapView, VectorStyle } from '@zys/globecore';
 import { AppLog } from '../common/AppLog';
 import { ColorHex } from '../common/ColorHex';
 import { GeoCalc, LatLng } from '../common/GeoCalc';
-import { MapDataStore, MeasurementRecord, TrackRecord } from '../db/MapDataStore';
 import { DocumentManager } from '../doc/DocumentManager';
-import { MediaPlacemark, MediaStore } from '../media/MediaStore';
+import { ProjectManager } from '../project/ProjectManager';
+import { MeasureRecord, PhotoRecord, Project, SurveyPlot, TrackRecord } from '../project/ProjectModels';
 import { MapStyle } from './MapStyle';
-import { SampleSurveyStore } from '../survey/SampleSurveyStore';
-import { SurveyPlot } from '../survey/SurveyModels';
 import { FeatureIcons } from '../vector/FeatureIcons';
 
 const TAG: string = 'BusinessOverlayManager';
@@ -81,7 +79,7 @@ export class BusinessOverlayManager {
   }
 
   /**
-   * 重建业务叠加层：读设置可见性开关 + 四类独立数据源，按数据签名判断是否需重建。
+   * 重建业务叠加层：读设置可见性开关 + 当前工程四类数据，按数据签名判断是否需重建。
    * 在页面显示 / 文档变更（开关落盘）/ 采集退出时调用。
    */
   async rebuild(): Promise<void> {
@@ -94,14 +92,12 @@ export class BusinessOverlayManager {
     const showMedia: boolean = cfg.showMediaLayer;
     const showPhotoName: boolean = cfg.showPhotoName;
 
-    const measures: MeasurementRecord[] = showMeasure
-      ? await (await MapDataStore.getInstance(this.ctx)).loadMeasurements() : [];
-    const tracks: TrackRecord[] = showTrack
-      ? await (await MapDataStore.getInstance(this.ctx)).loadTracks() : [];
-    const photos: MediaPlacemark[] = showMedia
-      ? await (await MediaStore.getInstance(this.ctx)).loadPlacemarks() : [];
+    const project: Project | null = ProjectManager.get(this.ctx).currentProject;
+    const measures: MeasureRecord[] = showMeasure && project !== null ? project.measures : [];
+    const tracks: TrackRecord[] = showTrack && project !== null ? project.tracks : [];
+    const photos: PhotoRecord[] = showMedia && project !== null ? project.photos : [];
     // 样地点位：无全局调查模式与显隐开关，常显
-    const plots: SurveyPlot[] = await (await SampleSurveyStore.getInstance(this.ctx)).loadAllPlots();
+    const plots: SurveyPlot[] = project !== null ? project.surveyPlots : [];
 
     const sig: string = BusinessOverlayManager.overlayDataSignature(showMeasure, showTrack, showMedia,
       showPhotoName, measures, tracks, photos, plots);
@@ -109,7 +105,7 @@ export class BusinessOverlayManager {
       return;
     }
     // TOCTOU 二次确认（对齐安卓 rebuild 全程同步的隐含保证）：本函数为 async，顶部门控是异步前的快照，
-    // 上面几个 await 期间事件循环可能已处理 activate()——采集态由 false 翻转为 true、live 层刚建出。
+    // 上面 await 期间事件循环可能已处理 activate()——采集态由 false 翻转为 true、live 层刚建出。
     // 若此时继续执行，clearOverlayLayers 会把这几层标记为 dead，之后每次点击的 updateOverlay* 都写进
     // dead 层被内核静默丢弃，表现为「加点/标注时有时无、无规律」。故此处再查一次采集态：命中即挂起本次
     // 重建，且不改写 overlaySignature，待退出采集的 rebuildOverlays 用同一签名再触发一次真正刷新。
@@ -127,7 +123,10 @@ export class BusinessOverlayManager {
     this.onOverlayLayersCleared();
 
     for (let i = 0; i < measures.length; i++) {
-      this.addMeasurementOverlay(measures[i]);
+      const m: MeasureRecord = measures[i];
+      if (!m.hidden) {
+        this.addMeasurementOverlay(m);
+      }
     }
     for (let i = 0; i < tracks.length; i++) {
       const t: TrackRecord = tracks[i];
@@ -148,28 +147,28 @@ export class BusinessOverlayManager {
   }
 
   /**
-   * 叠加数据签名：四个开关 + 各记录 id/样式/可见性/点数摘要拼接。
+   * 叠加数据签名：四个开关 + 各记录 id/样式/可见性/点数（拍照含坐标/名称/附件数）摘要拼接。
    * 测量/轨迹几何「写后不可变」（保存即定型），故点数足以捕获增删；样式/可见性变化亦纳入。
    */
   private static overlayDataSignature(showMeasure: boolean, showTrack: boolean, showMedia: boolean,
-    showPhotoName: boolean, measures: MeasurementRecord[], tracks: TrackRecord[],
-    photos: MediaPlacemark[], plots: SurveyPlot[]): string {
+    showPhotoName: boolean, measures: MeasureRecord[], tracks: TrackRecord[],
+    photos: PhotoRecord[], plots: SurveyPlot[]): string {
     const sb: string[] = [];
     sb.push(showMeasure ? 'M' : '-');
     sb.push(showTrack ? 'T' : '-');
     sb.push(showMedia ? 'P' : '-');
     sb.push(showPhotoName ? 'N' : '-');
     for (let i = 0; i < measures.length; i++) {
-      const m: MeasurementRecord = measures[i];
-      sb.push(`|m${m.id}:${m.type}:${m.color}:${m.lineWidth}:${m.points.length}`);
+      const m: MeasureRecord = measures[i];
+      sb.push(`|m${m.id}:${m.type}:${m.color}:${m.lineWidth}:${m.points.length}:${m.hidden ? 1 : 0}`);
     }
     for (let i = 0; i < tracks.length; i++) {
       const t: TrackRecord = tracks[i];
       sb.push(`|t${t.id}:${t.visible ? 1 : 0}:${t.color}:${t.lineWidth}:${t.points.length}`);
     }
     for (let i = 0; i < photos.length; i++) {
-      const p: MediaPlacemark = photos[i];
-      sb.push(`|p${p.id}:${p.visible ? 1 : 0}:${p.name}:${p.latitude}:${p.longitude}`);
+      const p: PhotoRecord = photos[i];
+      sb.push(`|p${p.id}:${p.visible ? 1 : 0}:${p.name}:${p.lat}:${p.lon}:${p.attachments.length}`);
     }
     for (let i = 0; i < plots.length; i++) {
       const s: SurveyPlot = plots[i];
@@ -178,18 +177,29 @@ export class BusinessOverlayManager {
     return sb.join('');
   }
 
+  /** 测量记录渲染色：记录色优先，缺省按类型回退模式默认色（距离=蓝、面积=绿、点位=黄） */
+  private static measureColorOf(record: MeasureRecord): number {
+    let def: number = MapStyle.MEASURE_COLOR_DISTANCE;
+    if (record.type === MeasureRecord.TYPE_AREA) {
+      def = MapStyle.MEASURE_COLOR_AREA;
+    } else if (record.type === MeasureRecord.TYPE_POINT) {
+      def = MapStyle.MEASURE_COLOR_POINT;
+    }
+    return ProjectManager.parseColor(record.color, def);
+  }
+
   /**
    * 测量记录 → 叠加层：点位 = 彩心圆点 + 名称标注；距离 = 折线 + 各测点累计距离（纯文字标注层）；
    * 面积 = 半透明填充 + 描边 + 各边中点边长与质心面积（纯文字标注层）。样式取记录自身颜色/线宽。
    */
-  private addMeasurementOverlay(record: MeasurementRecord): void {
+  private addMeasurementOverlay(record: MeasureRecord): void {
     const pts: Point[] = record.points;
     if (pts.length === 0) {
       return;
     }
-    const color: number = record.color;
+    const color: number = BusinessOverlayManager.measureColorOf(record);
     const lineW: number = record.lineWidth;
-    if (record.type === MeasurementRecord.TYPE_POINT) {
+    if (record.type === MeasureRecord.TYPE_POINT) {
       const idx: number = this.view.addOverlayLayer(BusinessOverlayManager.measureStyle(color, lineW, color));
       if (idx < 0) {
         return;
@@ -197,7 +207,7 @@ export class BusinessOverlayManager {
       this.measureOverlayIds.set(idx, record.id);
       const p: Point = pts[0];
       this.view.updateOverlayPoints(idx, BusinessOverlayManager.flattenLonLat(pts), [record.id], [record.name]);
-    } else if (record.type === MeasurementRecord.TYPE_DISTANCE) {
+    } else if (record.type === MeasureRecord.TYPE_DISTANCE) {
       if (pts.length < 2) {
         return;
       }
@@ -210,7 +220,7 @@ export class BusinessOverlayManager {
       this.view.updateOverlayLines(idx, BusinessOverlayManager.flattenLonLat(pts), [pts.length],
         [record.id], []);
       this.addMeasureLabelOverlay(record.id, record.type, pts);
-    } else if (record.type === MeasurementRecord.TYPE_AREA) {
+    } else if (record.type === MeasureRecord.TYPE_AREA) {
       if (pts.length < 3) {
         return;
       }
@@ -257,9 +267,10 @@ export class BusinessOverlayManager {
     this.view.updateOverlayPoints(idx, anchors.lonlat, fids, anchors.labels);
   }
 
-  /** 轨迹记录 → 一条折线叠加层：颜色/线宽取记录自身，无标注 */
+  /** 轨迹记录 → 一条折线叠加层：颜色取记录自身（空色回退默认青蓝），线宽取记录自身，无标注 */
   private addTrackOverlay(record: TrackRecord): void {
-    const style: VectorStyle = MapStyle.lineStyle(record.color, record.lineWidth);
+    const color: number = ProjectManager.parseColor(record.color, 0xFF33CCFF);
+    const style: VectorStyle = MapStyle.lineStyle(color, record.lineWidth);
     const idx: number = this.view.addOverlayLayer(style);
     if (idx < 0) {
       return;
@@ -271,11 +282,11 @@ export class BusinessOverlayManager {
 
   /**
    * 拍照点位 → 一点叠加层（全部可见点合一层）：图标程序化生成 camera 形状 billboard，
-   * fid = 点位主键（供交互查附件）；名称标注受 showPhotoName 控制。
+   * fid = 点位主键（供交互查附件）；名称标注受 showPhotoName 控制、空名回退「拍照(附件数)」。
    * 分组可见性已由管理界面写入各点 visible，故此处仅过滤 visible。
    */
-  private addMediaOverlay(photos: MediaPlacemark[], showName: boolean): void {
-    const visible: MediaPlacemark[] = photos.filter((p: MediaPlacemark): boolean => p.visible);
+  private addMediaOverlay(photos: PhotoRecord[], showName: boolean): void {
+    const visible: PhotoRecord[] = photos.filter((p: PhotoRecord): boolean => p.visible);
     if (visible.length === 0) {
       return;
     }
@@ -291,13 +302,22 @@ export class BusinessOverlayManager {
     const fids: number[] = [];
     const labels: string[] = [];
     for (let i = 0; i < visible.length; i++) {
-      const p: MediaPlacemark = visible[i];
-      lonlat.push(p.longitude);
-      lonlat.push(p.latitude);
+      const p: PhotoRecord = visible[i];
+      lonlat.push(p.lon);
+      lonlat.push(p.lat);
       fids.push(p.id);
-      labels.push(showName ? p.displayName() : '');
+      labels.push(showName ? BusinessOverlayManager.mediaDisplayName(p) : '');
     }
     this.view.updateOverlayPoints(idx, lonlat, fids, labels);
+  }
+
+  /** 拍照点位显示名：有名用名，空名回退「拍照(附件数)」/「拍照」 */
+  private static mediaDisplayName(p: PhotoRecord): string {
+    if (p.name.trim().length > 0) {
+      return p.name;
+    }
+    const count: number = p.attachments.length;
+    return count > 1 ? `拍照(${count})` : '拍照';
   }
 
   /**
@@ -305,7 +325,8 @@ export class BusinessOverlayManager {
    * 无有效中心坐标的样地跳过（新建未定位的草稿不显示）。
    */
   private addSurveyOverlay(plots: SurveyPlot[]): void {
-    const valid: SurveyPlot[] = plots.filter((p: SurveyPlot): boolean => p.hasCenter());
+    const valid: SurveyPlot[] = plots.filter((p: SurveyPlot): boolean =>
+      !Number.isNaN(p.centerLatitude) && !Number.isNaN(p.centerLongitude));
     if (valid.length === 0) {
       return;
     }
@@ -399,7 +420,7 @@ export class MeasureLabels {
   static anchors(type: string, pts: Point[]): MeasureLabelAnchors {
     const lonlat: number[] = [];
     const labels: string[] = [];
-    if (type === MeasurementRecord.TYPE_DISTANCE) {
+    if (type === MeasureRecord.TYPE_DISTANCE) {
       let cumulative: number = 0;
       for (let i = 0; i < pts.length; i++) {
         if (i > 0) {
@@ -409,7 +430,7 @@ export class MeasureLabels {
         lonlat.push(pts[i][0]);
         labels.push(GeoCalc.formatDistance(cumulative));
       }
-    } else if (type === MeasurementRecord.TYPE_AREA) {
+    } else if (type === MeasureRecord.TYPE_AREA) {
       if (pts.length >= 2) {
         for (let i = 1; i < pts.length; i++) {
           MeasureLabels.putEdge(pts[i - 1], pts[i], lonlat, labels);

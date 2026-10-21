@@ -8,14 +8,21 @@
 
 import { common } from '@kit.AbilityKit';
 import { router } from '@kit.ArkUI';
-import { GeoCalc } from '../common/GeoCalc';
+import fs from '@ohos.file.fs';
+import { AppDirs } from '../common/AppDirs';
+import { AppLog } from '../common/AppLog';
+import { GeoCalc, LatLng } from '../common/GeoCalc';
 import { Theme } from '../common/Theme';
 import { TimeText } from '../common/TimeText';
 import { Ui } from '../common/Ui';
-import { MapDataStore, TrackRecord } from '../db/MapDataStore';
 import { MapServices } from '../map/MapServices';
+import { ProjectManager } from '../project/ProjectManager';
+import { Project, TrackRecord } from '../project/ProjectModels';
 import { NameEditDialog } from '../components/NameEditDialog';
 import { TitleBar } from '../components/TitleBar';
+
+/** 轨迹草稿文件名（与 TrackController 同口径：工程目录下的隐藏草稿，记录中/崩溃未恢复即存在） */
+const DRAFT_FILE_NAME: string = '.track_draft.json';
 
 /** 列表行快照（键含影响显示的全部字段，值变即重绘） */
 class TrackRow {
@@ -54,33 +61,57 @@ struct TrackPage {
     }
   }
 
-  private store(): Promise<MapDataStore> {
-    const ctx: common.UIAbilityContext =
-      this.getUIContext().getHostContext() as common.UIAbilityContext;
-    return MapDataStore.getInstance(ctx);
+  private context(): common.UIAbilityContext {
+    return this.getUIContext().getHostContext() as common.UIAbilityContext;
   }
 
   private reload(): void {
-    this.store().then(async (store: MapDataStore): Promise<void> => {
-      const tracks: TrackRecord[] = await store.loadTracks();
-      this.records = tracks;
-      const rows: TrackRow[] = [];
-      for (let i = 0; i < tracks.length; i++) {
-        const t: TrackRecord = tracks[i];
-        const row: TrackRow = new TrackRow();
-        row.id = t.id;
-        row.name = t.name;
-        row.visible = t.visible;
-        row.subtitle = `${TimeText.dateTime(t.createdTime)}　·　${t.points.length}个点`
-          + `　·　${GeoCalc.formatDistance(t.lengthMeters())}`;
-        rows.push(row);
+    const pm: ProjectManager = ProjectManager.get(this.context());
+    const project: Project | null = pm.currentProject;
+    const tracks: TrackRecord[] = project === null ? [] : project.tracks;
+    this.records = tracks;
+    const rows: TrackRow[] = [];
+    for (let i = 0; i < tracks.length; i++) {
+      const t: TrackRecord = tracks[i];
+      const row: TrackRow = new TrackRow();
+      row.id = t.id;
+      row.name = t.name;
+      row.visible = t.visible;
+      row.subtitle = `${TimeText.dateTime(ProjectManager.parseTime(t.date))}　·　${t.points.length}个点`
+        + `　·　${GeoCalc.formatDistance(TrackPage.lengthOf(t))}`;
+      rows.push(row);
+    }
+    this.rows = rows;
+    // 草稿轨迹不在历史列表内，单独检查一次作为顶部提示（外业中避免误认为「未记录」而重复开启）
+    this.recordingTip = this.draftTip(pm);
+    this.loaded = true;
+  }
+
+  /** 草稿提示：草稿文件存在即提示（尝试读其 name 字段，读不到用通用文案） */
+  private draftTip(pm: ProjectManager): string {
+    const path: string = `${pm.projectsDir}/${DRAFT_FILE_NAME}`;
+    if (!AppDirs.exists(path)) {
+      return '';
+    }
+    try {
+      const o: Record<string, Object | null> = JSON.parse(fs.readTextSync(path)) as Record<string, Object | null>;
+      const name: Object | undefined | null = o['name'];
+      if (typeof name === 'string' && name.length > 0) {
+        return name;
       }
-      this.rows = rows;
-      // 草稿轨迹不在历史列表内，单独取一次作为顶部提示（外业中避免误认为「未记录」而重复开启）
-      const draft: TrackRecord | undefined = await store.loadDraftTrack();
-      this.recordingTip = draft === undefined ? '' : draft.name;
-      this.loaded = true;
-    });
+    } catch (e) {
+      AppLog.w('读轨迹草稿名失败', `${e}`);
+    }
+    return '有未完成的轨迹记录';
+  }
+
+  /** 轨迹总长（米）：TrackRecord 不缓存长度，按点串现算（与 Android trackGeometryText 同口径） */
+  private static lengthOf(t: TrackRecord): number {
+    const degrees: LatLng[] = [];
+    for (let i = 0; i < t.points.length; i++) {
+      degrees.push(new LatLng(t.points[i][0], t.points[i][1]));
+    }
+    return GeoCalc.polylineLengthMeters(degrees);
   }
 
   private findRecord(id: number): TrackRecord | undefined {
@@ -99,9 +130,8 @@ struct TrackPage {
         label: '名称',
         initialValue: row.name,
         onConfirmName: (name: string): void => {
-          this.store().then(async (store: MapDataStore): Promise<void> => {
-            await store.updateTrackName(row.id, name);
-            await this.reload();
+          ProjectManager.get(this.context()).updateTrackName(row.id, name).then((): void => {
+            this.reload();
             Ui.toast('已重命名');
           });
         },
@@ -114,9 +144,8 @@ struct TrackPage {
   }
 
   private toggleVisible(row: TrackRow, visible: boolean): void {
-    this.store().then(async (store: MapDataStore): Promise<void> => {
-      await store.updateTrackVisible(row.id, visible);
-      await this.reload();
+    ProjectManager.get(this.context()).updateTrackVisible(row.id, visible).then((): void => {
+      this.reload();
     });
   }
 
@@ -137,9 +166,8 @@ struct TrackPage {
     if (!ok) {
       return;
     }
-    const store: MapDataStore = await this.store();
-    await store.deleteTrack(row.id);
-    await this.reload();
+    await ProjectManager.get(this.context()).removeTrack(row.id);
+    this.reload();
     Ui.toast('已删除轨迹');
   }
 

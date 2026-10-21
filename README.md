@@ -1,10 +1,10 @@
 # MobileMap-harmonyos（调查宝 · HarmonyOS 版）
 
-调查宝（MobileMap 0.4.0.4）的 **HarmonyOS NEXT** 移植工程：面向野外调查/测绘场景的离线地图与矢量数据应用，集成自研地图渲染内核，以 ohpm 公开发布包 [`@zys/globecore`](https://ohpm.openharmony.cn/ohpm/@zys/globecore) 形式消费（ArkTS 门面 + NAPI + 共享 C++ 引擎，静态链接 GDAL/PROJ/libcurl 等，预打包 `libglobecore.so`）。
+调查宝（MobileMap 0.4.0.5）的 **HarmonyOS NEXT** 移植工程：面向野外调查/测绘场景的离线地图与矢量数据应用，集成自研地图渲染内核，以 ohpm 公开发布包 [`@zys/globecore`](https://ohpm.openharmony.cn/ohpm/@zys/globecore) 形式消费（ArkTS 门面 + NAPI + 共享 C++ 引擎，静态链接 GDAL/PROJ/libcurl 等，预打包 `libglobecore.so`）。
 
 - **包名**：`com.zys.MobileMap`
 - **应用名**：调查宝
-- **版本**：`0.4.0.4`（versionCode `26101706`，与 Android MobileMap 对齐，同一份 `update.json` 可跨端比较）
+- **版本**：`0.4.0.5`（versionCode `26102101`，与 Android MobileMap 对齐，同一份 `update.json` 可跨端比较）
 - **runtimeOS**：HarmonyOS ｜ targetSdk `26.0.0` ｜ compatibleSdk `5.0.0(12)`
 
 ## 架构与模块
@@ -17,7 +17,7 @@
 | `@zys/globecore` | ohpm 依赖（预编译 HAR） | 地图渲染内核：ArkTS 门面 + NAPI 桥 + 预编译 `libglobecore.so`（arm64-v8a / x86_64），由 GlobeCore 引擎仓打包发布 |
 | `AppScope` | — | 应用级配置与资源（包名、版本、图标、应用名） |
 
-地图渲染内核已发布为 ohpm 包 **`@zys/globecore`**，本工程以**预编译 HAR** 方式消费（`entry` 依赖 `"@zys/globecore": "0.1.1"`，import 路径统一为 `'@zys/globecore'`），构建时直接使用其中打包好的 ArkTS 门面与 `libglobecore.so`，不再从本仓源码编译原生引擎。
+地图渲染内核已发布为 ohpm 包 **`@zys/globecore`**，本工程以**预编译 HAR** 方式消费（`entry` 依赖 `"@zys/globecore": "0.1.4"`，import 路径统一为 `'@zys/globecore'`），构建时直接使用其中打包好的 ArkTS 门面与 `libglobecore.so`，不再从本仓源码编译原生引擎。
 
 ### 功能页面（entry）
 `Index`（地图主界面）、`LayerManagePage`、`AddLayerPage`、`SettingsPage`、`AboutPage`、`HelpPage`、`TrackPage`、`PhotoPage`、`PhotoViewerPage`、`FeatureDetailPage`、`SurveyListPage`、`SurveyEditPage`、`AppSourcePage`。

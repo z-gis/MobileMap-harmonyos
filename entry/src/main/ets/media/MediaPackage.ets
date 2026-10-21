@@ -20,7 +20,9 @@ import zlib from '@ohos.zlib';
 import { AppDirs } from '../common/AppDirs';
 import { AppLog } from '../common/AppLog';
 import { Ui } from '../common/Ui';
-import { MediaAttachment, MediaPlacemark, MediaStore } from './MediaStore';
+import { GpkgDml } from '../project/GpkgDml';
+import { ProjectManager } from '../project/ProjectManager';
+import { PhotoAttachment, PhotoRecord } from '../project/ProjectModels';
 
 /** 自定义扩展名（不含点）：数据实为 zip，接收方用本 app 打开触发导入 */
 const EXT: string = 'mphoto';
@@ -60,12 +62,25 @@ export interface PackageMetaJson {
   placemarks: PackagePlacemarkJson[];
 }
 
+/** 打包照片：附件 + 其在点位 attachments 内的序号（BLOB 回退按序号取）+ 已解出的字节（null=走磁盘文件） */
+export class PackagedPhoto {
+  att: PhotoAttachment;
+  attIndex: number = 0;
+  data: ArrayBuffer | null = null;
+
+  constructor(att: PhotoAttachment, attIndex: number, data: ArrayBuffer | null) {
+    this.att = att;
+    this.attIndex = attIndex;
+    this.data = data;
+  }
+}
+
 /** 打包条目：点位 + 其有效照片附件 */
 export class PackageEntry {
-  placemark: MediaPlacemark;
-  photos: MediaAttachment[];
+  placemark: PhotoRecord;
+  photos: PackagedPhoto[];
 
-  constructor(placemark: MediaPlacemark, photos: MediaAttachment[]) {
+  constructor(placemark: PhotoRecord, photos: PackagedPhoto[]) {
     this.placemark = placemark;
     this.photos = photos;
   }
@@ -83,9 +98,9 @@ export class MediaPackage {
   }
 
   /** 分享单个拍照点位：打包其坐标/名称/全部照片后经系统分享面板发出 */
-  static async sharePlacemark(ctx: common.UIAbilityContext, placemark: MediaPlacemark): Promise<void> {
+  static async sharePlacemark(ctx: common.UIAbilityContext, placemark: PhotoRecord): Promise<void> {
     const subject: string = placemark.name.trim().length > 0 ? placemark.name : '拍照点位';
-    const entries: PackageEntry[] = MediaPackage.collectEntries([placemark]);
+    const entries: PackageEntry[] = await MediaPackage.collectEntries(ctx, [placemark]);
     await MediaPackage.shareEntries(ctx, null, entries, subject);
   }
 
@@ -94,9 +109,9 @@ export class MediaPackage {
    * groupName 非空时写入包内，导入据此重建同名分组；未分组分享传 null。
    */
   static async shareGroup(ctx: common.UIAbilityContext, groupName: string | null,
-    placemarks: MediaPlacemark[]): Promise<void> {
+    placemarks: PhotoRecord[]): Promise<void> {
     const subject: string = groupName !== null && groupName.trim().length > 0 ? groupName : '拍照分组';
-    const entries: PackageEntry[] = MediaPackage.collectEntries(placemarks);
+    const entries: PackageEntry[] = await MediaPackage.collectEntries(ctx, placemarks);
     await MediaPackage.shareEntries(ctx, groupName, entries, subject);
   }
 
@@ -130,7 +145,7 @@ export class MediaPackage {
    * （照片复制到 调查宝/Media/<新点位ID>/），返回新建点位列表（失败或空包返回空列表）。
    * @param packagePath 数据包沙箱绝对路径（由调用方经文件选择器取回沙箱）
    */
-  static async importPackage(ctx: common.UIAbilityContext, packagePath: string): Promise<MediaPlacemark[]> {
+  static async importPackage(ctx: common.UIAbilityContext, packagePath: string): Promise<PhotoRecord[]> {
     if (!AppDirs.exists(packagePath)) {
       return [];
     }
@@ -165,15 +180,30 @@ export class MediaPackage {
     }
   }
 
-  /** 仅保留有照片的点位（过滤非照片附件与失效文件） */
-  private static collectEntries(placemarks: MediaPlacemark[]): PackageEntry[] {
+  /**
+   * 仅保留有照片的点位。附件来源二选一（对齐 Android buildPackage）：
+   * 磁盘原件（旧数据尚未清扫）→ 走文件复制；已清扫 → 工程 gpkg BLOB 解出字节随包写入。
+   */
+  private static async collectEntries(ctx: common.UIAbilityContext,
+    placemarks: PhotoRecord[]): Promise<PackageEntry[]> {
+    const gpkgPath: string = ProjectManager.get(ctx).currentProjectPath;
     const entries: PackageEntry[] = [];
     for (let i = 0; i < placemarks.length; i++) {
-      const p: MediaPlacemark = placemarks[i];
-      const photos: MediaAttachment[] = p.attachments.filter((a: MediaAttachment): boolean => {
-        return a.type === MediaAttachment.TYPE_PHOTO && AppDirs.exists(a.path)
-          && fs.statSync(a.path).size > 0;
-      });
+      const p: PhotoRecord = placemarks[i];
+      const photos: PackagedPhoto[] = [];
+      for (let j = 0; j < p.attachments.length; j++) {
+        const a: PhotoAttachment = p.attachments[j];
+        if (a.path.length > 0 && AppDirs.exists(a.path) && fs.statSync(a.path).size > 0) {
+          photos.push(new PackagedPhoto(a, j, null));
+          continue;
+        }
+        if (gpkgPath.length > 0) {
+          const data: ArrayBuffer | null = await GpkgDml.readPhotoBlob(gpkgPath, p.id, j);
+          if (data !== null && data.byteLength > 0) {
+            photos.push(new PackagedPhoto(a, j, data));
+          }
+        }
+      }
       if (photos.length > 0) {
         entries.push(new PackageEntry(p, photos));
       }
@@ -194,7 +224,7 @@ export class MediaPackage {
     MediaPackage.cleanStalePackages(shareDir);
 
     const stamp: number = Date.now();
-    const first: MediaPlacemark = entries[0].placemark;
+    const first: PhotoRecord = entries[0].placemark;
     const fallback: string = first.name.trim().length > 0 ? first.name : '拍照数据包';
     const base: string = MediaPackage.sanitize(groupName !== null && groupName.trim().length > 0
       ? groupName : fallback);
@@ -207,11 +237,17 @@ export class MediaPackage {
         JSON.stringify(MediaPackage.buildMeta(groupName, entries, stamp), null, 2));
 
       for (let i = 0; i < entries.length; i++) {
-        const photos: MediaAttachment[] = entries[i].photos;
+        const photos: PackagedPhoto[] = entries[i].photos;
         const subDir: string = AppDirs.ensureDir(`${stageDir}/${i}`);
         for (let j = 0; j < photos.length; j++) {
-          const src: string = photos[j].path;
-          fs.copyFileSync(src, `${subDir}/${MediaPackage.nameOfPath(src)}`);
+          const photo: PackagedPhoto = photos[j];
+          const dest: string = `${subDir}/${MediaPackage.photoNameOf(photo.att)}`;
+          if (photo.data !== null) {
+            // BLOB 回退：解出的字节直接写入 zip 条目（暂存文件），不在媒体目录落盘
+            MediaPackage.writeBytes(dest, photo.data);
+          } else {
+            fs.copyFileSync(photo.att.path, dest);
+          }
         }
       }
 
@@ -237,17 +273,17 @@ export class MediaPackage {
     stamp: number): PackageMetaJson {
     const placemarks: PackagePlacemarkJson[] = [];
     for (let i = 0; i < entries.length; i++) {
-      const p: MediaPlacemark = entries[i].placemark;
+      const p: PhotoRecord = entries[i].placemark;
       const photos: string[] = [];
-      const list: MediaAttachment[] = entries[i].photos;
+      const list: PackagedPhoto[] = entries[i].photos;
       for (let j = 0; j < list.length; j++) {
-        photos.push(`${i}/${MediaPackage.nameOfPath(list[j].path)}`);
+        photos.push(`${i}/${MediaPackage.photoNameOf(list[j].att)}`);
       }
       const item: PackagePlacemarkJson = {
         name: p.name,
-        latitude: p.latitude,
-        longitude: p.longitude,
-        createdTime: p.createdTime,
+        latitude: p.lat,
+        longitude: p.lon,
+        createdTime: p.timestamp,
         photos: photos,
       };
       placemarks.push(item);
@@ -264,16 +300,19 @@ export class MediaPackage {
     return meta;
   }
 
-  /** 按元数据在库中新建点位并复制照片（分组包先建同名分组承接） */
+  /** 按元数据在工程中新建点位并把照片收进 BLOB（分组包先复用/新建同名分组承接，对齐 Android createPlacemarks） */
   private static async createPlacemarks(ctx: common.UIAbilityContext, rootDir: string,
-    meta: PackageMetaJson): Promise<MediaPlacemark[]> {
-    const store: MediaStore = await MediaStore.getInstance(ctx);
+    meta: PackageMetaJson): Promise<PhotoRecord[]> {
+    const pm: ProjectManager = ProjectManager.get(ctx);
     const mediaDir: string = AppDirs.mediaDir();
     const groupName: string = meta.groupName ?? '';
-    const groupId: number = groupName.trim().length > 0
-      ? await store.insertGroup(groupName, Date.now()) : MediaStore.UNGROUPED_ID;
+    let groupId: number = ProjectManager.UNGROUPED_ID;
+    if (groupName.trim().length > 0) {
+      const existing = pm.findGroupByName(groupName);
+      groupId = existing !== null ? existing.id : await pm.addGroup(groupName, Date.now());
+    }
 
-    const created: MediaPlacemark[] = [];
+    const created: PhotoRecord[] = [];
     const list: PackagePlacemarkJson[] = meta.placemarks ?? [];
     for (let i = 0; i < list.length; i++) {
       const po: PackagePlacemarkJson = list[i];
@@ -284,12 +323,14 @@ export class MediaPackage {
       }
       const name: string = po.name ?? '';
       const createdTime: number = po.createdTime ?? Date.now();
-      const newId: number = await store.insertPlacemark(name, lat, lon, createdTime, groupId);
+      const newId: number = await pm.addPhoto(name, lat, lon, createdTime);
       if (newId < 0) {
         continue;
       }
+      if (groupId !== ProjectManager.UNGROUPED_ID) {
+        await pm.updatePhotoGroup(newId, groupId);
+      }
       const destDir: string = AppDirs.ensureDir(`${mediaDir}/${newId}`);
-      const result: MediaPlacemark = new MediaPlacemark(newId, name, lat, lon, createdTime, true, groupId, []);
 
       const photos: string[] = po.photos ?? [];
       for (let j = 0; j < photos.length; j++) {
@@ -300,14 +341,14 @@ export class MediaPackage {
         }
         const target: string = MediaPackage.uniqueFile(destDir, MediaPackage.nameOfPath(src));
         fs.copyFileSync(src, target);
-        // 附件时间按序递增，保证导入后照片顺序与打包时一致
-        const attTime: number = createdTime + j;
-        const attId: number = await store.insertAttachment(newId, MediaAttachment.TYPE_PHOTO,
-          MediaPackage.nameOfPath(target), target, attTime);
-        result.attachments.push(new MediaAttachment(attId, newId, MediaAttachment.TYPE_PHOTO,
-          MediaPackage.nameOfPath(target), target, attTime));
+        // 附件时间按序递增，保证导入后照片顺序与打包时一致；
+        // addPhotoAttachment 收 BLOB 成功后自行删除该临时文件
+        await pm.addPhotoAttachment(newId, MediaPackage.nameOfPath(target), target, createdTime + j);
       }
-      created.push(result);
+      const createdRecord: PhotoRecord | null = pm.findPhoto(newId);
+      if (createdRecord !== null) {
+        created.push(createdRecord);
+      }
     }
     return created;
   }
@@ -405,6 +446,26 @@ export class MediaPackage {
   private static nameOfPath(path: string): string {
     const idx: number = path.lastIndexOf('/');
     return idx >= 0 ? path.substring(idx + 1) : path;
+  }
+
+  /** 附件的打包文件名：优先取磁盘路径文件名，BLOB 仅存（path 为空）时回退附件名 */
+  private static photoNameOf(att: PhotoAttachment): string {
+    if (att.path.length > 0) {
+      const n: string = MediaPackage.nameOfPath(att.path);
+      if (n.length > 0) {
+        return n;
+      }
+    }
+    return att.name.length > 0 ? att.name : `${att.time}.jpg`;
+  }
+
+  private static writeBytes(path: string, data: ArrayBuffer): void {
+    const file = fs.openSync(path, fs.OpenMode.READ_WRITE | fs.OpenMode.CREATE | fs.OpenMode.TRUNC);
+    try {
+      fs.writeSync(file.fd, data);
+    } finally {
+      fs.closeSync(file);
+    }
   }
 
   private static parentOf(path: string): string {

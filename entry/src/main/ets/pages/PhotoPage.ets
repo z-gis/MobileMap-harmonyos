@@ -15,15 +15,16 @@ import { Theme } from '../common/Theme';
 import { TimeText } from '../common/TimeText';
 import { Ui } from '../common/Ui';
 import { MapServices } from '../map/MapServices';
-import { MediaAttachment, MediaGroup, MediaPlacemark, MediaStore } from '../media/MediaStore';
 import { MediaPackage } from '../media/MediaPackage';
+import { ProjectManager } from '../project/ProjectManager';
+import { MediaGroupRecord, PhotoRecord, Project } from '../project/ProjectModels';
 import { MediaEditDialog } from '../components/MediaEditDialog';
 import { NameEditDialog } from '../components/NameEditDialog';
 import { PhotoViewerParams } from './RouteParams';
 import { TitleBar } from '../components/TitleBar';
 
 /** 未分组虚拟节 id */
-const UNGROUPED: number = MediaStore.UNGROUPED_ID;
+const UNGROUPED: number = ProjectManager.UNGROUPED_ID;
 /** 未分组节名（Android 同文案） */
 const UNGROUPED_NAME: string = '未分组';
 
@@ -69,8 +70,8 @@ struct PhotoPage {
   @State collapsedIds: number[] = [];
 
   /** 原始记录：分享与编辑需要 attachments / 经纬度等完整字段 */
-  private groups: MediaGroup[] = [];
-  private placemarks: MediaPlacemark[] = [];
+  private groups: MediaGroupRecord[] = [];
+  private placemarks: PhotoRecord[] = [];
   private editDialog: CustomDialogController | undefined = undefined;
   private groupDialog: CustomDialogController | undefined = undefined;
 
@@ -85,37 +86,31 @@ struct PhotoPage {
     }
   }
 
-  private store(): Promise<MediaStore> {
-    const ctx: common.UIAbilityContext =
-      this.getUIContext().getHostContext() as common.UIAbilityContext;
-    return MediaStore.getInstance(ctx);
-  }
-
   private context(): common.UIAbilityContext {
     return this.getUIContext().getHostContext() as common.UIAbilityContext;
   }
 
   private reload(): void {
-    this.store().then(async (store: MediaStore): Promise<void> => {
-      this.groups = await store.loadGroups();
-      this.placemarks = await store.loadPlacemarks();
-      this.rows = this.buildRows();
-      this.loaded = true;
-    });
+    const pm: ProjectManager = ProjectManager.get(this.context());
+    const project: Project | null = pm.currentProject;
+    this.groups = pm.listGroups();
+    this.placemarks = project === null ? [] : project.photos;
+    this.rows = this.buildRows();
+    this.loaded = true;
   }
 
   /** 真实分组在前（按建组顺序），未分组虚拟节在最后 */
   private buildRows(): MediaRow[] {
     const rows: MediaRow[] = [];
     for (let i = 0; i < this.groups.length; i++) {
-      const g: MediaGroup = this.groups[i];
-      const members: MediaPlacemark[] = this.inGroup(g.id);
+      const g: MediaGroupRecord = this.groups[i];
+      const members: PhotoRecord[] = this.inGroup(g.id);
       rows.push(this.headerRow(g.id, g.name, members));
       if (!this.isCollapsed(g.id)) {
         this.appendPlacemarks(rows, members);
       }
     }
-    const rest: MediaPlacemark[] = this.inGroup(UNGROUPED);
+    const rest: PhotoRecord[] = this.inGroup(UNGROUPED);
     rows.push(this.headerRow(UNGROUPED, UNGROUPED_NAME, rest));
     if (!this.isCollapsed(UNGROUPED)) {
       this.appendPlacemarks(rows, rest);
@@ -123,7 +118,7 @@ struct PhotoPage {
     return rows;
   }
 
-  private headerRow(groupId: number, name: string, members: MediaPlacemark[]): MediaRow {
+  private headerRow(groupId: number, name: string, members: PhotoRecord[]): MediaRow {
     const row: MediaRow = new MediaRow();
     row.header = true;
     row.groupId = groupId;
@@ -133,7 +128,7 @@ struct PhotoPage {
     let photos: number = 0;
     let allVisible: boolean = members.length > 0;
     for (let i = 0; i < members.length; i++) {
-      photos += this.photoCount(members[i]);
+      photos += members[i].attachments.length;
       allVisible = allVisible && members[i].visible;
     }
     row.photoCount = photos;
@@ -141,26 +136,26 @@ struct PhotoPage {
     return row;
   }
 
-  private appendPlacemarks(rows: MediaRow[], members: MediaPlacemark[]): void {
+  private appendPlacemarks(rows: MediaRow[], members: PhotoRecord[]): void {
     for (let i = 0; i < members.length; i++) {
-      const p: MediaPlacemark = members[i];
-      const photos: number = this.photoCount(p);
+      const p: PhotoRecord = members[i];
+      const photos: number = p.attachments.length;
       const row: MediaRow = new MediaRow();
       row.header = false;
       row.placemarkId = p.id;
-      row.name = p.displayName();
+      row.name = PhotoPage.displayNameOf(p);
       row.visible = p.visible;
-      row.latitude = p.latitude;
-      row.longitude = p.longitude;
+      row.latitude = p.lat;
+      row.longitude = p.lon;
       row.itemPhotos = photos;
-      row.subtitle = `${TimeText.dateTime(p.createdTime)}　·　`
+      row.subtitle = `${TimeText.dateTime(p.timestamp)}　·　`
         + `${photos > 0 ? `${photos}张照片` : '无照片'}`;
       rows.push(row);
     }
   }
 
-  private inGroup(groupId: number): MediaPlacemark[] {
-    const out: MediaPlacemark[] = [];
+  private inGroup(groupId: number): PhotoRecord[] {
+    const out: PhotoRecord[] = [];
     for (let i = 0; i < this.placemarks.length; i++) {
       if (this.placemarks[i].groupId === groupId) {
         out.push(this.placemarks[i]);
@@ -169,7 +164,7 @@ struct PhotoPage {
     return out;
   }
 
-  private findPlacemark(id: number): MediaPlacemark | undefined {
+  private findPlacemark(id: number): PhotoRecord | undefined {
     for (let i = 0; i < this.placemarks.length; i++) {
       if (this.placemarks[i].id === id) {
         return this.placemarks[i];
@@ -178,14 +173,12 @@ struct PhotoPage {
     return undefined;
   }
 
-  private photoCount(p: MediaPlacemark): number {
-    let n: number = 0;
-    for (let i = 0; i < p.attachments.length; i++) {
-      if (p.attachments[i].type === MediaAttachment.TYPE_PHOTO) {
-        n++;
-      }
+  /** 点位显示名（与旧 MediaPlacemark.displayName 同口径：无名按附件数给默认名） */
+  private static displayNameOf(p: PhotoRecord): string {
+    if (p.name.trim().length > 0) {
+      return p.name;
     }
-    return n;
+    return p.attachments.length > 1 ? `拍照(${p.attachments.length})` : '拍照';
   }
 
   private isCollapsed(groupId: number): boolean {
@@ -212,13 +205,12 @@ struct PhotoPage {
         label: '分组',
         placeholder: '请输入分组名称',
         onConfirmName: (name: string): void => {
-          this.store().then(async (store: MediaStore): Promise<void> => {
-            const id: number = await store.insertGroup(name, Date.now());
+          ProjectManager.get(this.context()).addGroup(name, Date.now()).then((id: number): void => {
             if (id < 0) {
               Ui.toast('新建分组失败');
               return;
             }
-            await this.reload();
+            this.reload();
             Ui.toast(`已新建分组：${name}`);
           });
         },
@@ -238,9 +230,8 @@ struct PhotoPage {
         initialValue: row.groupName,
         placeholder: '请输入分组名称',
         onConfirmName: (name: string): void => {
-          this.store().then(async (store: MediaStore): Promise<void> => {
-            await store.updateGroupName(row.groupId, name);
-            await this.reload();
+          ProjectManager.get(this.context()).renameGroup(row.groupId, name).then((): void => {
+            this.reload();
             Ui.toast('已重命名分组');
           });
         },
@@ -258,21 +249,19 @@ struct PhotoPage {
     if (!ok) {
       return;
     }
-    const store: MediaStore = await this.store();
-    await store.deleteGroup(row.groupId);
-    await this.reload();
+    await ProjectManager.get(this.context()).removeGroup(row.groupId);
+    this.reload();
     Ui.toast('已删除分组');
   }
 
   private toggleGroupVisible(row: MediaRow, visible: boolean): void {
-    this.store().then(async (store: MediaStore): Promise<void> => {
-      await store.setGroupPlacemarksVisible(row.groupId, visible);
-      await this.reload();
+    ProjectManager.get(this.context()).setGroupPhotosVisible(row.groupId, visible).then((): void => {
+      this.reload();
     });
   }
 
   private shareGroup(row: MediaRow): void {
-    const members: MediaPlacemark[] = this.inGroup(row.groupId);
+    const members: PhotoRecord[] = this.inGroup(row.groupId);
     if (members.length === 0) {
       Ui.toast('该分组没有拍照标识');
       return;
@@ -286,7 +275,7 @@ struct PhotoPage {
   // ── 点位动作 ────────────────────────────────────────────────────
 
   private openEdit(row: MediaRow): void {
-    const placemark: MediaPlacemark | undefined = this.findPlacemark(row.placemarkId);
+    const placemark: PhotoRecord | undefined = this.findPlacemark(row.placemarkId);
     if (placemark === undefined) {
       return;
     }
@@ -307,27 +296,28 @@ struct PhotoPage {
 
   /** 新建分组要先落库拿到主键，再把点位改到该组（对话框内的临时组名尚未入库） */
   private applyEdit(placemarkId: number, name: string, groupId: number, newGroupName: string): void {
-    this.store().then(async (store: MediaStore): Promise<void> => {
+    const pm: ProjectManager = ProjectManager.get(this.context());
+    const run = async (): Promise<void> => {
       let target: number = groupId;
       if (newGroupName.length > 0) {
-        const created: number = await store.insertGroup(newGroupName, Date.now());
+        const created: number = await pm.addGroup(newGroupName, Date.now());
         if (created < 0) {
           Ui.toast('新建分组失败');
           return;
         }
         target = created;
       }
-      await store.updatePlacemarkName(placemarkId, name);
-      await store.updatePlacemarkGroup(placemarkId, target);
-      await this.reload();
+      await pm.updatePhotoName(placemarkId, name);
+      await pm.updatePhotoGroup(placemarkId, target);
+      this.reload();
       Ui.toast('已保存');
-    });
+    };
+    run();
   }
 
   private togglePlacemarkVisible(row: MediaRow, visible: boolean): void {
-    this.store().then(async (store: MediaStore): Promise<void> => {
-      await store.updatePlacemarkVisible(row.placemarkId, visible);
-      await this.reload();
+    ProjectManager.get(this.context()).updatePhotoVisible(row.placemarkId, visible).then((): void => {
+      this.reload();
     });
   }
 
@@ -354,11 +344,10 @@ struct PhotoPage {
     if (!ok) {
       return;
     }
-    const store: MediaStore = await this.store();
-    await store.deletePlacemark(row.placemarkId);
-    // 附件目录随点位删除（库内只记路径，文件归调用方清理，与 Android 同口径）
+    await ProjectManager.get(this.context()).removePhoto(row.placemarkId);
+    // 附件目录随点位删除（照片本体在 gpkg BLOB，磁盘原件可能仍有未清扫残留，与 Android 同口径一并清理）
     AppDirs.removeTree(`${AppDirs.mediaDir()}/${row.placemarkId}`);
-    await this.reload();
+    this.reload();
     Ui.toast('已删除');
   }
 

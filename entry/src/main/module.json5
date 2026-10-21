@@ -57,6 +57,17 @@
         }
       },
       {
+        // 长时任务（后台定位保活，continuousTaskManager location 型）：system_grant 普通级权限，随清单生效
+        "name": "ohos.permission.KEEP_BACKGROUND_RUNNING",
+        "reason": "$string:perm_location_reason",
+        "usedScene": {
+          "abilities": [
+            "EntryAbility"
+          ],
+          "when": "always"
+        }
+      },
+      {
         "name": "ohos.permission.CAMERA",
         "reason": "$string:perm_camera_reason",
         "usedScene": {
@@ -79,6 +90,10 @@
         // 跟随设备自动旋转（对齐 Android 端：MobileMap27 的 manifest 未做任何方向锁定）
         "orientation": "auto_rotation",
         "removeMissionAfterTerminate": true,
+        // 长时任务类型：轨迹记录期后台定位保活（continuousTaskManager.startBackgroundRunning 的 ['location']）
+        "backgroundModes": [
+          "location"
+        ],
         "exported": true,
         "skills": [
           {

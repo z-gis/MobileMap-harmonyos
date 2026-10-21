@@ -10,6 +10,7 @@
     "pages/PhotoPage",
     "pages/PhotoViewerPage",
     "pages/FeatureDetailPage",
+    "pages/ProjectManagePage",
     "pages/SurveyListPage",
     "pages/SurveyEditPage",
     "pages/AppSourcePage"

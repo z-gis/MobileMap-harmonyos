@@ -12,8 +12,8 @@ import { Theme } from '../common/Theme';
 import { TimeText } from '../common/TimeText';
 import { Ui } from '../common/Ui';
 import { LocationManager, LocationPoint } from '../location/LocationManager';
-import { SampleSurveyStore } from '../survey/SampleSurveyStore';
-import { SurveyPlot } from '../survey/SurveyModels';
+import { ProjectManager } from '../project/ProjectManager';
+import { SurveyPlot } from '../project/ProjectModels';
 import { TitleBar } from '../components/TitleBar';
 import { SurveyEditParams, SurveyEntryContext, SurveyListParams } from './RouteParams';
 
@@ -121,16 +121,14 @@ struct SurveyListPage {
 
   private reload(): void {
     const ctx: common.UIAbilityContext = this.getUIContext().getHostContext() as common.UIAbilityContext;
-    SampleSurveyStore.getInstance(ctx).then(async (store: SampleSurveyStore): Promise<void> => {
-      const plots: SurveyPlot[] = await store.loadPlots(this.sourcePath, this.sourceFid);
-      this.plots = plots;
-      this.loaded = true;
-      if (plots.length === 0 && this.firstLoad) {
-        // 无任何样地：不进空列表页，直接替为录入页（返回键回到要素详情，与 Android 一致）
-        this.toEdit(-1);
-      }
-      this.firstLoad = false;
-    });
+    const plots: SurveyPlot[] = ProjectManager.get(ctx).findSurveyPlots(this.sourcePath, this.sourceFid);
+    this.plots = plots;
+    this.loaded = true;
+    if (plots.length === 0 && this.firstLoad) {
+      // 无任何样地：不进空列表页，直接替为录入页（返回键回到要素详情，与 Android 一致）
+      this.toEdit(-1);
+    }
+    this.firstLoad = false;
   }
 
   private toEdit(plotId: number): void {
@@ -149,17 +147,14 @@ struct SurveyListPage {
   }
 
   private async removePlot(plot: SurveyPlot): Promise<void> {
-    const ok: boolean = await Ui.confirm('删除样地', `确定删除「${plot.title()}」及其全部调查明细？`, '删除');
+    const ok: boolean = await Ui.confirm('删除样地', `确定删除「${SurveyListPage.titleOf(plot)}」及其全部调查明细？`, '删除');
     if (!ok) {
       return;
     }
     const ctx: common.UIAbilityContext = this.getUIContext().getHostContext() as common.UIAbilityContext;
-    const store: SampleSurveyStore = await SampleSurveyStore.getInstance(ctx);
-    const done: boolean = await store.deletePlot(plot.id);
-    Ui.toast(done ? '已删除' : '删除失败');
-    if (done) {
-      this.reload();
-    }
+    await ProjectManager.get(ctx).removeSurveyPlot(plot.id);
+    Ui.toast('已删除');
+    this.reload();
   }
 
   build() {
@@ -213,7 +208,7 @@ struct SurveyListPage {
   plotCard(plot: SurveyPlot) {
     Column() {
       Row() {
-        Text(plot.title())
+        Text(SurveyListPage.titleOf(plot))
           .fontSize(Theme.FONT)
           .fontWeight(FontWeight.Medium)
           .fontColor(Theme.TEXT)
@@ -235,6 +230,11 @@ struct SurveyListPage {
     .alignItems(HorizontalAlign.Start)
     .backgroundColor(Theme.CARD)
     .borderRadius(Theme.RADIUS)
+  }
+
+  /** 样地显示名（工程模型无 title()，与 Android 迁移命名同口径） */
+  private static titleOf(plot: SurveyPlot): string {
+    return `样地#${plot.plotNo}`;
   }
 
   /** 列表副标题：树高 / 郁闭度 / 明细数 / 更新时间（缺项省略，与录入页字段同序） */

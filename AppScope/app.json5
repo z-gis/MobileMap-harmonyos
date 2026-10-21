@@ -2,9 +2,9 @@
   "app": {
     "bundleName": "com.zys.MobileMap",
     "vendor": "example",
-    // 版本与 Android MobileMap 对齐（versionCode 26101706 / 0.4.0.4），使同一份 update.json 可跨端比较
-    "versionCode": 26101706,
-    "versionName": "0.4.0.4",
+    // 版本与 Android MobileMap 对齐（versionCode 26102101 / 0.4.0.5），使同一份 update.json 可跨端比较
+    "versionCode": 26102101,
+    "versionName": "0.4.0.5",
     "buildVersion": "1",
     "icon": "$media:layered_image",
     "label": "$string:app_name"

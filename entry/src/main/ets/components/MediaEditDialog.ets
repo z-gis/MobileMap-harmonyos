@@ -7,31 +7,34 @@
 
 import { Theme } from '../common/Theme';
 import { Ui } from '../common/Ui';
-import { MediaGroup, MediaPlacemark, MediaStore } from '../media/MediaStore';
+import { ProjectManager } from '../project/ProjectManager';
+import { MediaGroupRecord, PhotoRecord } from '../project/ProjectModels';
 
 /** 分组下拉首项文本（对应 Android 的「未分组」，选中即 groupId = UNGROUPED_ID） */
 const GROUP_NONE: string = '未分组';
+/** 未分组标识（转发 ProjectManager.UNGROUPED_ID，组件内少一处依赖） */
+const UNGROUPED_ID: number = ProjectManager.UNGROUPED_ID;
 
 @CustomDialog
 export struct MediaEditDialog {
   controller: CustomDialogController;
   /** 待编辑点位（只读，用于回显名称与当前分组） */
-  placemark: MediaPlacemark | undefined = undefined;
+  placemark: PhotoRecord | undefined = undefined;
   /** 现有分组（宿主加载后下发） */
-  @Prop groups: MediaGroup[] = [];
+  @Prop groups: MediaGroupRecord[] = [];
   /** 确认回调：新名称、目标分组、需即时新建的分组名（空表示不新建） */
   onConfirmEdit: (name: string, groupId: number, newGroupName: string) => void =
     (): void => {};
 
   @State nameText: string = '';
-  @State groupId: number = MediaStore.UNGROUPED_ID;
+  @State groupId: number = UNGROUPED_ID;
   @State showNewGroup: boolean = false;
   @State newGroupName: string = '';
   /** 新建分组的临时项：下拉需立刻可选到它，故并入选项列表（不落库，由宿主创建） */
   @State pendingGroupName: string = '';
 
   aboutToAppear(): void {
-    const p: MediaPlacemark | undefined = this.placemark;
+    const p: PhotoRecord | undefined = this.placemark;
     if (p !== undefined) {
       this.nameText = p.name;
       this.groupId = p.groupId;
@@ -53,17 +56,17 @@ export struct MediaEditDialog {
   /** 选项序号 → 分组主键（0 为未分组，末位可能是本次新建名） */
   private idOfIndex(index: number): number {
     if (index === 0) {
-      return MediaStore.UNGROUPED_ID;
+      return UNGROUPED_ID;
     }
     if (index <= this.groups.length) {
       return this.groups[index - 1].id;
     }
-    return MediaStore.UNGROUPED_ID;
+    return UNGROUPED_ID;
   }
 
   /** 当前分组主键对应的选项序号（找不到即未分组） */
   private indexOfGroup(): number {
-    if (this.groupId === MediaStore.UNGROUPED_ID) {
+    if (this.groupId === UNGROUPED_ID) {
       return 0;
     }
     for (let i = 0; i < this.groups.length; i++) {
@@ -181,7 +184,7 @@ export struct MediaEditDialog {
               }
               // 新建分组先作为临时项进下拉并选中，落库延后到「确定」由宿主一并完成
               this.pendingGroupName = name;
-              this.groupId = MediaStore.UNGROUPED_ID;
+              this.groupId = UNGROUPED_ID;
               this.showNewGroup = false;
             })
         }

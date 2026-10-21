@@ -58,6 +58,8 @@ export interface SystemConfigJson {
   coordDisplayMeter?: boolean;
   showKmlLabel?: boolean;
   viewMode3d?: boolean;
+  rasterTileCacheEnabled?: boolean;
+  tileOfflineOnly?: boolean;
 }
 
 export interface MapDocumentJson {
@@ -434,6 +436,10 @@ export class SystemConfig {
    * 主界面回页读回此值即时生效。
    */
   viewMode3d: boolean = false;
+  /** 本地栅格瓦片缓存开关（默认开；关闭时栅格层以空缓存目录加入，native 不落瓦片） */
+  rasterTileCacheEnabled: boolean = true;
+  /** 在线图源仅读离线缓存开关（默认关；打开后底图/注记不联网取瓦，只显示已落盘缓存瓦片） */
+  tileOfflineOnly: boolean = false;
 
   toJson(): SystemConfigJson {
     const o: SystemConfigJson = {
@@ -447,6 +453,8 @@ export class SystemConfig {
       coordDisplayMeter: this.coordDisplayMeter,
       showKmlLabel: this.showKmlLabel,
       viewMode3d: this.viewMode3d,
+      rasterTileCacheEnabled: this.rasterTileCacheEnabled,
+      tileOfflineOnly: this.tileOfflineOnly,
     };
     return o;
   }
@@ -466,6 +474,8 @@ export class SystemConfig {
     c.coordDisplayMeter = o.coordDisplayMeter ?? false;
     c.showKmlLabel = o.showKmlLabel ?? false;
     c.viewMode3d = o.viewMode3d ?? false;
+    c.rasterTileCacheEnabled = o.rasterTileCacheEnabled ?? true;
+    c.tileOfflineOnly = o.tileOfflineOnly ?? false;
     return c;
   }
 }

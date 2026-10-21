@@ -1,7 +1,8 @@
-// MediaCaptureHelper.ets —— 拍照会话管理（对应 Android media.MediaCaptureHelper）。
+// MediaCaptureHelper.ets —— 拍照会话管理（对应 Android media.MediaCaptureHelper，0.4.0.4 工程版）。
 //
-// 语义与 Android 一致：一次会话对应一个媒体点位（Placemark），拍照后不退出，可继续拍，
-// 多张照片作为同一点位的多个附件保存；附件文件落沙箱 调查宝/Media/<点位ID>/IMG_yyyyMMdd_HHmmss.jpg。
+// 语义与 Android 一致：一次会话对应一个拍照点位（PhotoRecord），拍照后不退出，可继续拍，
+// 多张照片作为同一点位的多个附件保存；附件文件落沙箱 调查宝/Media/<点位ID>/IMG_yyyyMMdd_HHmmss.jpg，
+// 照片本体经 ProjectManager.addPhotoAttachment 增量入库 gpkg BLOB，库提交成功后源文件自动删除。
 //
 // 平台差异：
 //   调起相机 Android 用 ACTION_IMAGE_CAPTURE + FileProvider；鸿蒙用 cameraPicker.pick + saveUri，
@@ -10,7 +11,7 @@
 //     故不再走 Android 的「先申请相机权限再调起」分支。
 //   弹窗 Android 用 AlertDialog/MediaEditDialog；鸿蒙普通类无法弹自定义对话框，
 //     连拍询问走 Ui.items，完成后的「改名 + 分组」编辑交由页面（onEditSession 回调）呈现。
-//   空点位清理 Android deleteRecursively；鸿蒙 fs.rmdir 支持递归删除。
+//   空点位清理 Android deleteRecursively；鸿蒙 AppDirs.removeTree 递归删除。
 
 import { camera, cameraPicker } from '@kit.CameraKit';
 import { common } from '@kit.AbilityKit';
@@ -22,8 +23,11 @@ import { Ui } from '../common/Ui';
 import { MapDocument } from '../doc/DocModels';
 import { DocumentManager } from '../doc/DocumentManager';
 import { LocationManager, LocationPoint } from '../location/LocationManager';
-import { MediaAttachment, MediaPlacemark, MediaStore } from './MediaStore';
+import { ProjectManager } from '../project/ProjectManager';
+import { PhotoRecord } from '../project/ProjectModels';
 import { MediaWatermark } from './MediaWatermark';
+
+const TAG: string = 'MediaCapture';
 
 /** 附件落库记绝对沙箱路径（与 Android 记绝对路径同口径，读取端无需再拼根目录） */
 export class MediaCaptureHelper {
@@ -38,7 +42,7 @@ export class MediaCaptureHelper {
   /** 媒体数据变化（新增/删除附件、点位名称或分组变更）后回调，页面据此刷新标注 */
   onMediaChanged: () => void = (): void => {};
   /** 会话完成回调：页面呈现「修改名称 + 所属分组」编辑面板（等价 Android MediaEditDialog） */
-  onEditSession: (placemark: MediaPlacemark) => void = (placemark: MediaPlacemark): void => {};
+  onEditSession: (photo: PhotoRecord) => void = (photo: PhotoRecord): void => {};
 
   constructor(ctx: common.UIAbilityContext) {
     this.ctx = ctx;
@@ -57,10 +61,8 @@ export class MediaCaptureHelper {
 
   /**
    * 启动拍照：会话首张固定坐标并建点位 → 准备附件文件 → 调起系统相机。
-   * @param groupId 新点位所属分组（-1 未分组）；会话已存在时忽略该参数
    */
-  async launchPhotoCapture(groupId: number = MediaStore.UNGROUPED_ID): Promise<void> {
-    const store: MediaStore = await MediaStore.getInstance(this.ctx);
+  async launchPhotoCapture(): Promise<void> {
     if (this.sessionPlacemarkId < 0) {
       const location: LocationPoint | null = LocationManager.getInstance().getLastLocation();
       if (location === null) {
@@ -71,9 +73,9 @@ export class MediaCaptureHelper {
       this.pendingCaptureLon = location.longitude;
 
       const now: number = Date.now();
-      this.sessionPlacemarkId = await store.insertPlacemark(
+      this.sessionPlacemarkId = await ProjectManager.get(this.ctx).addPhoto(
         MediaCaptureHelper.formatPlacemarkName(now),
-        this.pendingCaptureLat, this.pendingCaptureLon, now, groupId);
+        this.pendingCaptureLat, this.pendingCaptureLon, now);
       if (this.sessionPlacemarkId < 0) {
         Ui.toast('创建拍照记录失败');
         return;
@@ -109,7 +111,7 @@ export class MediaCaptureHelper {
   }
 
   /**
-   * 拍照结果处理：成功则加水印并写附件记录，随后询问继续或完成；
+   * 拍照结果处理：成功则加水印并把照片本体入库 gpkg BLOB（库提交成功后源文件删除），随后询问继续或完成；
    * 失败则清理尚无附件的空点位（避免地图残留无照片标注）。
    */
   private async handleCaptureResult(success: boolean): Promise<void> {
@@ -124,9 +126,11 @@ export class MediaCaptureHelper {
       Ui.toast('照片保存失败');
       return;
     }
+    const fileBytes: number = fs.statSync(path).size;
 
     const capturedAt: number = Date.now();
-    const store: MediaStore = await MediaStore.getInstance(this.ctx);
+    const t0: number = Date.now();
+    const pm: ProjectManager = ProjectManager.get(this.ctx);
 
     // 按设置添加坐标水印；水印失败不影响照片与记录（与 Android 提示口径一致）
     const doc: MapDocument | null = DocumentManager.getInstance().getDocument();
@@ -138,10 +142,15 @@ export class MediaCaptureHelper {
         Ui.toastLong('照片已保存，但添加坐标水印失败');
       }
     }
+    const t1: number = Date.now();
 
+    // 写入附件记录（照片本体增量入库 gpkg BLOB，库提交成功后源文件自动删除）
     const fileName: string = MediaCaptureHelper.nameOfPath(path);
-    await store.insertAttachment(this.sessionPlacemarkId, MediaAttachment.TYPE_PHOTO,
-      fileName, path, capturedAt);
+    await pm.addPhotoAttachment(this.sessionPlacemarkId, fileName, path, capturedAt);
+    // 鸿蒙增量写为同步 NAPI，saveNow 语义 = 元数据落盘（对齐 Android 栅栏排空语义）
+    await pm.saveNow();
+    AppLog.i(`${TAG} 照片入库耗时 水印=${t1 - t0}ms 读文件+BLOB落库=${Date.now() - t1}ms `
+      + `合计=${Date.now() - t0}ms bytes=${fileBytes}`);
     this.clearPendingCapture();
     this.onMediaChanged();
     Ui.toast('照片已保存并标注');
@@ -170,11 +179,10 @@ export class MediaCaptureHelper {
    */
   private async finishSession(): Promise<void> {
     const placemarkId: number = this.sessionPlacemarkId;
-    const store: MediaStore = await MediaStore.getInstance(this.ctx);
-    const placemark: MediaPlacemark | undefined = await store.findPlacemark(placemarkId);
+    const photo: PhotoRecord | null = ProjectManager.get(this.ctx).findPhoto(placemarkId);
     this.resetSession();
-    if (placemark !== undefined) {
-      this.onEditSession(placemark);
+    if (photo !== null) {
+      this.onEditSession(photo);
     }
   }
 
@@ -186,12 +194,12 @@ export class MediaCaptureHelper {
     if (this.sessionPlacemarkId < 0) {
       return;
     }
-    const store: MediaStore = await MediaStore.getInstance(this.ctx);
-    const placemark: MediaPlacemark | undefined = await store.findPlacemark(this.sessionPlacemarkId);
-    if (placemark !== undefined && placemark.attachments.length === 0) {
+    const pm: ProjectManager = ProjectManager.get(this.ctx);
+    const photo: PhotoRecord | null = pm.findPhoto(this.sessionPlacemarkId);
+    if (photo !== null && photo.attachments.length === 0) {
       const dir: string = this.sessionDir();
-      await store.deletePlacemark(this.sessionPlacemarkId);
-      MediaCaptureHelper.removeDir(dir);
+      await pm.removePhoto(this.sessionPlacemarkId);
+      AppDirs.removeTree(dir);
       this.resetSession();
       this.onMediaChanged();
     }
@@ -228,11 +236,6 @@ export class MediaCaptureHelper {
       AppLog.e('创建媒体文件失败', e);
       return false;
     }
-  }
-
-  /** 删除会话目录（可能含 picker 预留的 0 字节文件），递归清理；失败仅记日志 */
-  private static removeDir(path: string): void {
-    AppDirs.removeTree(path);
   }
 
   private static nameOfPath(path: string): string {
