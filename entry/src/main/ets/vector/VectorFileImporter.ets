@@ -14,6 +14,7 @@
 // 无需 Android 侧的 GBK 回退探测（鸿蒙 zlib 实现按 UTF-8 处理）。
 
 import fs from '@ohos.file.fs';
+import uri from '@ohos.uri';
 import zlib from '@ohos.zlib';
 import { promptAction } from '@kit.ArkUI';
 import { AppDirs } from '../common/AppDirs';
@@ -29,6 +30,22 @@ export class ImportResult {
 
   constructor(path: string, name: string) {
     this.path = path;
+    this.name = name;
+  }
+}
+
+/**
+ * 导入候选：源主文件 URI + 同组附属 URI + 建议显示名（去扩展名）。
+ * 规划阶段只枚举不拷贝，供宿主先判同名冲突（重新导入 / 重命名导入）再决定落盘前缀。
+ */
+export class ImportCandidate {
+  mainUri: string;
+  sideCars: string[];
+  name: string;
+
+  constructor(mainUri: string, sideCars: string[], name: string) {
+    this.mainUri = mainUri;
+    this.sideCars = sideCars;
     this.name = name;
   }
 }
@@ -130,6 +147,166 @@ export class VectorFileImporter {
     return new ImportResult(path, AppDirs.deriveBaseName(fileName));
   }
 
+  /**
+   * 枚举授权文件夹下的主数据文件（矢量/栅格白名单，排除附属与子目录），返回完整 URI 列表。
+   * FOLDER 选择返回 file://docs/... 目录 URI：fs 不接受该 URI 直接列目录（实测报 No such file），
+   * 须先经 uri.URI.path 取出解码路径再 listFile；子项 URI 由父 URI 换 path 派生（保持原编码）。
+   * 枚举失败返回空（宿主据此降级 FILE 选择器）。
+   */
+  static listMainInFolder(folderUri: string, raster: boolean): string[] {
+    const out: string[] = [];
+    let folderPath: string = '';
+    try {
+      folderPath = new uri.URI(folderUri).path;
+    } catch (e) {
+      AppLog.e(`文件夹 URI 解析失败: ${folderUri}`, e);
+      return out;
+    }
+    if (folderPath.length === 0) {
+      AppLog.w(`文件夹路径为空: ${folderUri}`);
+      return out;
+    }
+    let names: string[] = [];
+    try {
+      names = fs.listFileSync(folderPath, { recursion: false });
+    } catch (e) {
+      AppLog.e(`目录枚举失败: ${folderPath}`, e);
+      return out;
+    }
+    const base: uri.URI = new uri.URI(folderUri);
+    for (let i = 0; i < names.length; i++) {
+      const n: string = names[i];
+      if (n.length === 0 || n.startsWith('.')) {
+        continue;
+      }
+      const childPath: string = `${folderPath}/${n}`;
+      try {
+        if (!fs.statSync(childPath).isFile()) {
+          continue;
+        }
+      } catch (e) {
+        continue;
+      }
+      const isMain: boolean = raster ? VectorFormats.isRaster(n) : VectorFormats.isVector(n);
+      if (!isMain) {
+        continue;
+      }
+      base.path = childPath;
+      out.push(base.toString());
+    }
+    AppLog.i(`文件夹枚举[${folderPath}]: 主文件 ${out.length} 个`);
+    return out;
+  }
+
+  /**
+   * 在已授权文件夹下收齐主文件的同名前缀附属（FOLDER 授权覆盖目录子项，未点选的兄弟也可直读）。
+   * 单文件授权（FILE 选择）下兄弟必被拒，故收族只在目录授权链路调用；这里 openSync 可成。
+   * URI 由父 URI 换 path 派生（uri.URI 负责编码），逐个探测，能读即收。
+   */
+  static collectFolderSiblings(mainUri: string): string[] {
+    const fileName: string = VectorFileImporter.fileNameOfUri(mainUri);
+    const dot: number = fileName.lastIndexOf('.');
+    if (dot <= 0) {
+      return [];
+    }
+    const stem: string = fileName.substring(0, dot);
+    let parent: uri.URI;
+    let folderPath: string;
+    try {
+      parent = new uri.URI(mainUri);
+      folderPath = parent.path;
+    } catch (e) {
+      AppLog.e(`主文件 URI 解析失败: ${mainUri}`, e);
+      return [];
+    }
+    const slash: number = folderPath.lastIndexOf('/');
+    if (slash < 0) {
+      return [];
+    }
+    const dirPath: string = folderPath.substring(0, slash);
+    const out: string[] = [];
+    const exts: string[] = VectorFormats.SIDE_CAR_EXTS;
+    for (let i = 0; i < exts.length; i++) {
+      const childPath: string = `${dirPath}/${stem}.${exts[i]}`;
+      parent.path = childPath;
+      const sib: string = parent.toString();
+      let f: fs.File | null = null;
+      try {
+        f = fs.openSync(sib, fs.OpenMode.READ_ONLY);
+        out.push(sib);
+        AppLog.i(`附属可读: .${exts[i]}`);
+      } catch (e) {
+        AppLog.w(`附属不可读（不存在或无授权）: .${exts[i]}`);
+      } finally {
+        if (f !== null) {
+          try {
+            fs.closeSync(f);
+          } catch (e) {
+            AppLog.w(`关闭附属描述符异常: ${e}`);
+          }
+        }
+      }
+    }
+    AppLog.i(`目录授权收族[${stem}]: 读到 ${out.length} 个附属`);
+    return out;
+  }
+
+  /**
+   * 把一组源 URI 按「去扩展名基础名」分组、每组挑主文件，产出候选（不拷贝）。
+   * 与 importPicked 同分组口径，但延后落盘，供宿主先判同名冲突。
+   */
+  static planSources(uris: string[]): ImportCandidate[] {
+    const groups: Map<string, string[]> = new Map<string, string[]>();
+    for (let i = 0; i < uris.length; i++) {
+      const key: string = VectorFileImporter.baseNameOfUri(uris[i]);
+      const list: string[] | undefined = groups.get(key);
+      if (list === undefined) {
+        groups.set(key, [uris[i]]);
+      } else {
+        list.push(uris[i]);
+      }
+    }
+    const out: ImportCandidate[] = [];
+    const keys: string[] = Array.from(groups.keys());
+    for (let i = 0; i < keys.length; i++) {
+      const members: string[] = groups.get(keys[i]) ?? [];
+      const main: string | undefined = VectorFileImporter.findMainFile(members);
+      if (main === undefined) {
+        continue;
+      }
+      const rest: string[] = members.filter((u: string) => u !== main);
+      const name: string = AppDirs.deriveBaseName(VectorFileImporter.fileNameOfUri(main));
+      out.push(new ImportCandidate(main, rest, name));
+    }
+    return out;
+  }
+
+  /**
+   * 按指定目标前缀把候选的主文件 + 全部附属整族拷入沙箱 layer/（覆盖式）。
+   * 附属文件随主文件换前缀（保留 .dbf/.shp.xml 等完整后缀），保证 shp 族同名依赖完整。
+   * 重新导入传原名（覆盖刷新），重命名导入传新名（另存）。主文件拷贝失败返回 null。
+   */
+  static importGroup(candidate: ImportCandidate, targetStem: string): ImportResult | null {
+    const destDir: string = AppDirs.ensureDir(AppDirs.dir(AppDirs.LAYER));
+    const mainName: string = VectorFileImporter.fileNameOfUri(candidate.mainUri);
+    const mainExt: string = VectorFormats.extOf(mainName);
+    const rawStem: string = VectorFileImporter.stemOf(mainName);
+    const safeStem: string = AppDirs.sanitizeFileName(targetStem);
+    const dest: string = mainExt.length === 0 ? `${destDir}/${safeStem}` : `${destDir}/${safeStem}.${mainExt}`;
+    if (!VectorFileImporter.copyTo(candidate.mainUri, dest)) {
+      return null;
+    }
+    for (let i = 0; i < candidate.sideCars.length; i++) {
+      const sn: string = VectorFileImporter.fileNameOfUri(candidate.sideCars[i]);
+      const targetName: string = sn.startsWith(rawStem)
+        ? `${safeStem}${sn.substring(rawStem.length)}`
+        : AppDirs.sanitizeFileName(sn);
+      VectorFileImporter.copyTo(candidate.sideCars[i], `${destDir}/${targetName}`);
+    }
+    AppLog.i(`整族拷入[${safeStem}] 主文件+${candidate.sideCars.length} 附属`);
+    return new ImportResult(dest, targetStem);
+  }
+
   /** 普通数据文件：拷入 layer 目录（同名覆盖），附属文件一并拷入 */
   private static async importPlain(uri: string, sideCars: string[], fileName: string,
     stem: string): Promise<ImportResult | null> {
@@ -180,6 +357,8 @@ export class VectorFileImporter {
     if (shps.length === 0) {
       const tmpDir: string = `${destDir}${UNZIP_TMP_SUFFIX}`;
       VectorFileImporter.removeDir(tmpDir);
+      // zlib.decompressFile 要求目标目录已存在（缺目录报 900002），清残留后必须重建
+      AppDirs.ensureDir(tmpDir);
       await zlib.decompressFile(archivePath, tmpDir);
       shps = VectorFileImporter.collectShapefiles(tmpDir);
       for (let i = 0; i < shps.length; i++) {
@@ -353,6 +532,8 @@ export class VectorFileImporter {
     displayName: string): Promise<ImportResult | null> {
     let target: string | null = AppDirs.exists(destDir) ? VectorFileImporter.findInDir(destDir, ['kml']) : null;
     if (target === null) {
+      // zlib.decompressFile 要求目标目录已存在（缺目录报 900002）
+      AppDirs.ensureDir(destDir);
       await zlib.decompressFile(archivePath, destDir);
       target = VectorFileImporter.findInDir(destDir, ['kml']);
     }

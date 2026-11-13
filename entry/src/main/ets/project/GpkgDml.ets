@@ -3,10 +3,14 @@
 // 引擎侧（globecore HAR）导出 NativeGpkg 门面，函数与 Android JNI 同语义：
 // 整读写与日常增量写全部走 GDAL（nativeReadGeoPackage / nativeWriteGeoPackage 整文件
 // tmp+rename 原子替换；nativeGpkg* 增量 DML 经 OGRLayer CreateFeature/SetFeature/
-// DeleteFeature 落业务七表 tracks/measures/photos/media_groups/survey_plots/
-// project_meta/layer_refs），照片本体 BLOB 入库（主照片 photos.photo_data，第 2..N 张
-// 附件附加表 photo_att_data，未注册表走 ExecuteSQL x'hex' 字面量）。
-// 鸿蒙全 GDAL 路径无需像 Android 纯 SQLite 那样清除 rtree 触发器/索引（GDAL 自带模块）。
+// DeleteFeature 落业务表，空间表按几何类型拆分：tracks / measures_point /
+// measures_line / measures_polygon / photos / media_groups / survey_point /
+// survey_polygon / project_meta / layer_refs），照片本体 BLOB 入库（主照片
+// photos.photo_data，第 2..N 张附件附加表 photo_att_data，未注册表走 ExecuteSQL
+// x'hex' 字面量）。老库的 measures / survey_plots 混装单表仍可读、增量写会回退落
+// 老表，由 prepareSchema 原地迁移拆表（详见 GpkgDml.prepareSchema）。
+// 鸿蒙全 GDAL 路径无需像 Android 纯 SQLite 那样清除 rtree 触发器/索引（GDAL 自带模块），
+// 建库时统一 SPATIAL_INDEX=NO，与 Android 产物保持同一文件形状。
 //
 // 调用风格与现有 native 调用一致（见 vector/GdalVectorReader.ets）：native 为同步函数，
 // 本类每个函数一个 async 包装（try/catch 吞异常记日志、回兜底值），UI/管理器侧一律 await。
@@ -16,7 +20,7 @@
 //    对应记录 toJsonObject() 全量（轨迹 points 为平铺前 [[lon,lat,alt],...]，含 id）；
 //  updateTrack：   {"name":?, "color":?, "hidden":bool, "lineWidth":int}
 //  updateMeasure： {"color":?, "lineWidth":int}
-//  updatePhoto：   稀疏列包，仅带需改键 {"name":?} / {"groupId":long} / {"visible":bool}
+//  updatePhoto：   稀疏列包，仅带需改键 {"name":?} / {"groupId":long} / {"visible":bool} / {"remark":?}
 //                  附件整行重写时 {"attachments":[{name,path,time},...], "photo_path":"主照片路径"}
 //  syncMeta：      {"meta":{"name":?,"description":?,"srs":?,"createTime":long,"updateTime":long},
 //                   "layerRefs":["图层绝对路径",...]}
@@ -54,7 +58,13 @@ export class GpkgDml {
 
   // ── schema 检查 / 准备 ──
 
-  /** 业务表与列是否齐备（齐备即可增量写；文件不存在返回 true，由新建流程负责建库） */
+  /**
+   * 业务表与列是否齐备（齐备即可增量写；文件不存在返回 true，由新建流程负责建库）。
+   * 量测/样地两种形状都算齐备：新库的 measures_point/measures_line/measures_polygon +
+   * survey_point/survey_polygon 分表，或老库的 measures / survey_plots 混装单表。
+   * 老库返回 true 是有意的——返回 false 会触发宿主整文件重建，而重建会丢掉只存在于库内的照片 BLOB；
+   * 混装单表由 prepareSchema 原地迁移成分表。
+   */
   static async schemaCurrent(path: string): Promise<boolean> {
     try {
       return NativeGpkg.nativeGpkgSchemaCurrent(path);
@@ -65,9 +75,12 @@ export class GpkgDml {
   }
 
   /**
-   * 写前准备（幂等）：补建附件 BLOB 附加表 photo_att_data。
+   * 写前准备（幂等）：补建附件 BLOB 附加表 photo_att_data、修正 gpkg_geometry_columns.z，
+   * 并把老库的 measures / survey_plots 混装单表原地迁移为按几何类型拆分的分表
+   * （ArcMap 10.8 靠 gpkg_geometry_columns 的写实类型定 shapeType，混装 GEOMETRY 表会吞要素）。
    * （Android 纯 SQLite 路径还需移除 RTree 触发器/索引并清 gpkg_extensions 登记项；
-   * 鸿蒙走 GDAL 自带 rtree 模块，native 侧无需该清理。）
+   * 鸿蒙走 GDAL 自带 rtree 模块，native 侧无需该清理，但新建库同样以 SPATIAL_INDEX=NO 不建索引，
+   * 保证两端产出的文件形状一致。）
    */
   static async prepareSchema(path: string): Promise<boolean> {
     try {
@@ -152,7 +165,7 @@ export class GpkgDml {
     }
   }
 
-  /** 更新拍照点位列（json 稀疏：name/groupId/visible/attachments/photo_path 按需携带） */
+  /** 更新拍照点位列（json 稀疏：name/groupId/visible/remark/attachments/photo_path 按需携带） */
   static async updatePhoto(path: string, id: number, json: string): Promise<boolean> {
     try {
       return NativeGpkg.nativeGpkgUpdatePhoto(path, id, json);

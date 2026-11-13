@@ -1,0 +1,80 @@
+{
+  "module": {
+    "name": "entry_pc",
+    "type": "entry",
+    "description": "$string:module_desc",
+    "mainElement": "PcAbility",
+    // 只声明 2in1（鸿蒙 PC / 二合一）：手机、平板不会分发本 HAP，
+    // 反之 entry（phone/tablet）也不会出现在 PC 上——同一 bundleName 下的双入口形态。
+    "deviceTypes": [
+      "2in1"
+    ],
+    "deliveryWithInstall": true,
+    "installationFree": false,
+    "pages": "$profile:main_pages",
+    // 桌面端权限收敛：只保留联网（底图瓦片）。
+    // 定位/轨迹/拍照属外业场景，PC 端不申请，系统也就不会弹授权框。
+    "requestPermissions": [
+      {
+        "name": "ohos.permission.INTERNET",
+        "reason": "$string:perm_net_reason",
+        "usedScene": {
+          "abilities": [
+            "PcAbility"
+          ],
+          "when": "always"
+        }
+      },
+      {
+        "name": "ohos.permission.GET_NETWORK_INFO",
+        "reason": "$string:perm_net_reason",
+        "usedScene": {
+          "abilities": [
+            "PcAbility"
+          ],
+          "when": "always"
+        }
+      }
+    ],
+    "abilities": [
+      {
+        "name": "PcAbility",
+        "srcEntry": "./ets/entryability/PcAbility.ets",
+        "description": "$string:PcAbility_desc",
+        "icon": "$media:layered_image",
+        "label": "$string:PcAbility_label",
+        "startWindowIcon": "$media:startIcon",
+        "startWindowBackground": "$color:start_window_background",
+        // 方向跟随系统窗口（PC 上由窗口管理器决定，不做应用侧锁定）
+        "orientation": "follow_desktop",
+        "exported": true,
+        "skills": [
+          {
+            "entities": [
+              "entity.system.home"
+            ],
+            "actions": [
+              "ohos.want.action.home"
+            ]
+          },
+          {
+            "actions": [
+              "ohos.want.action.viewData"
+            ],
+            "uris": [
+              {
+                "scheme": "file", "type": "general.zip-archive", "linkFeature": "FileOpen"
+              },
+              {
+                "scheme": "file", "type": "application/zip", "linkFeature": "FileOpen"
+              },
+              {
+                "scheme": "file", "type": "application/vnd.google-earth.kmz", "linkFeature": "FileOpen"
+              }
+            ]
+          }
+        ]
+      }
+    ]
+  }
+}

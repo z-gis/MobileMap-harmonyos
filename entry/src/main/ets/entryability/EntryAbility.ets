@@ -14,6 +14,7 @@ import { window } from '@kit.ArkUI';
 import { NativeNet, NativeSrs } from '@zys/globecore';
 import { AppDirs } from '../common/AppDirs';
 import { AppLog } from '../common/AppLog';
+import { PageData, PageKeys, PageSignals } from '../common/PageData';
 import { SystemInsets } from '../common/SystemInsets';
 import { DocumentManager } from '../doc/DocumentManager';
 import { ProjectManager } from '../project/ProjectManager';
@@ -44,10 +45,36 @@ export default class EntryAbility extends UIAbility {
       AppLog.e('工程装载失败', `${e}`);
     });
     AppLog.i(`${TAG} onCreate 初始化完成 ${Date.now() - t0}ms`);
+    // 6) 外部打开（文件管理「打开方式」等经 viewData 拉起）：URI 先入交接槽，
+    //    由主地图页装配完成后消费（此时才有图层控制器与文档，冷启动时序不可提前）
+    this.offerExternalWant(want);
+  }
+
+  /** 已在运行中再次被外部打开（launchType=singleton，对齐 Android singleTask） */
+  onNewWant(want: Want, launchParam: AbilityConstant.LaunchParam): void {
+    AppLog.i(`${TAG} onNewWant`);
+    this.offerExternalWant(want);
+  }
+
+  /** 取外部打开的文件 URI 入槽并通知主地图页；桌面图标启动不带 uri，静默跳过 */
+  private offerExternalWant(want: Want): void {
+    // 各入口（文件管理/文件预览/微信）传的 action 口径不一，故不按 action 过滤，只认 uri；
+    // 原始 want 全量落日志便于对账（parameters 里可能另有 ability.params.stream 授权清单）
+    AppLog.i(`${TAG} want action=${want.action ?? ''} type=${want.type ?? ''} uri=${want.uri ?? ''}`
+      + ` flags=${want.flags ?? 0} params=${JSON.stringify(want.parameters ?? {})}`);
+    const uri: string | undefined = want.uri;
+    if (uri === undefined || uri.length === 0) {
+      return;
+    }
+    PageData.put(PageKeys.EXTERNAL_OPEN_URI, uri);
+    // 主地图页已装配（热启动）时立即消费；未装配时 fire 无人绑定，槽位留待 setupMap 收尾取用
+    PageSignals.fire(PageKeys.EXTERNAL_OPEN_URI);
   }
 
   onDestroy(): void {
     AppLog.i(`${TAG} onDestroy`);
+    // 落盘前的缓冲日志（D/I 攒批）随生命周期收尾刷出，减小进程回收丢失窗口
+    AppLog.flush();
   }
 
   onWindowStageCreate(windowStage: window.WindowStage): void {
@@ -85,5 +112,7 @@ export default class EntryAbility extends UIAbility {
 
   onBackground(): void {
     // 后台定位由 systemConfig.backgroundLocation 决定（LocationManager 按间隔持续订阅，无需在此干预）
+    // 退后台时把攒批的文件日志刷出（外业现场杀进程/回收后日志仍可取回）
+    AppLog.flush();
   }
 }

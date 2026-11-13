@@ -12,9 +12,24 @@
 //     无 Android GnssStatus 的 usedInFix 逐星标志，故定位详情只展示「可见数 + 平均信噪比」。
 
 import { geoLocationManager } from '@kit.LocationKit';
+import { systemDateTime } from '@kit.BasicServicesKit';
 import { AppLog } from '../common/AppLog';
 
 const TAG: string = 'LocationManager';
+
+/**
+ * 单调时钟（毫秒，含深睡）：等价 Android SystemClock.elapsedRealtime，轨迹门控算相邻点间隔用。
+ * 取 TimeType.STARTUP（自开机起算、**含**休眠），不用 ACTIVE（不含休眠会让息屏期间的间隔偏小，
+ * 速度判据会把「息屏后走了一段」误判成超音速）。API 缺失时退化为墙钟（只影响 gap 精度，不影响正确性）。
+ */
+export function monotonicNow(): number {
+  try {
+    return systemDateTime.getUptime(systemDateTime.TimeType.STARTUP, false);
+  } catch (e) {
+    AppLog.w('getUptime 失败，退化为墙钟', `${e}`);
+    return Date.now();
+  }
+}
 
 /** 最小更新间隔（秒），对齐 Android MIN_INTERVAL_MS = 2000 */
 const MIN_INTERVAL_S: number = 2;
@@ -38,10 +53,18 @@ export class LocationPoint {
   direction: number = Number.NaN;
   /** 数据源（geoLocationManager.LocationSourceType 数值），-1 未知 */
   sourceType: number = -1;
+  /**
+   * time 是否来自设备上报的 timeStamp（false 表示设备未上报，time 为接收时刻墙钟）。
+   * 轨迹门控据此决定能不能按「fix 年龄」拒陈旧点——来源不明时不能凭 time 判新旧。
+   */
+  timeFromDevice: boolean = false;
+  /** 本点在 LocationManager 收到时的单调时钟（毫秒），轨迹门控算相邻点间隔用 */
+  receivedMonotonicMs: number = 0;
 
   constructor(latitude: number = 0, longitude: number = 0, altitude: number = Number.NaN,
     time: number = 0, accuracy: number = -1, speed: number = Number.NaN,
-    direction: number = Number.NaN, sourceType: number = -1) {
+    direction: number = Number.NaN, sourceType: number = -1,
+    timeFromDevice: boolean = false, receivedMonotonicMs: number = 0) {
     this.latitude = latitude;
     this.longitude = longitude;
     this.altitude = altitude;
@@ -50,6 +73,8 @@ export class LocationPoint {
     this.speed = speed;
     this.direction = direction;
     this.sourceType = sourceType;
+    this.timeFromDevice = timeFromDevice;
+    this.receivedMonotonicMs = receivedMonotonicMs;
   }
 }
 
@@ -291,14 +316,16 @@ export class LocationManager {
       && !Number.isNaN(location.altitude)) {
       alt = location.altitude;
     }
-    // timeStamp 为「距 1970 的秒数」（部分设备返回 0 表示未填充）
+    // timeStamp 为「距 1970 的秒数」（部分设备返回 0 表示未填充）；未填充时 time 退回接收时刻墙钟，
+    // 并置 timeFromDevice=false，轨迹门控就不会拿这个 time 去判 fix 年龄（判了会把整条轨迹卡死）
     const seconds: number = location.timeStamp;
-    const time: number = seconds > 100000 ? seconds * 1000 : Date.now();
+    const fromDevice: boolean = seconds > 100000;
+    const time: number = fromDevice ? seconds * 1000 : Date.now();
     // speed/direction 部分设备（尤其网络定位）不填，给 0/非法值时统一当无信息处理
     const speed: number = Number.isFinite(location.speed) ? location.speed : Number.NaN;
     const direction: number = Number.isFinite(location.direction) ? location.direction : Number.NaN;
     const source: number = location.sourceType !== undefined ? location.sourceType : -1;
     return new LocationPoint(location.latitude, location.longitude, alt, time,
-      location.accuracy ?? -1, speed, direction, source);
+      location.accuracy ?? -1, speed, direction, source, fromDevice, monotonicNow());
   }
 }

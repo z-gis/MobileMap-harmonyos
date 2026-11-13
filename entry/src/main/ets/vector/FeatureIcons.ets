@@ -14,7 +14,12 @@ export class FeatureIcons {
   static readonly STAR: string = 'star';
   static readonly FLAG: string = 'flag';
 
-  /** 生成位图边长（像素）：native 按 iconW/iconH 作 dp 尺寸，纹理分辨率固定 64 */
+  /**
+   * 生成位图边长（像素）：纹理分辨率固定 64，且调用点传给内核的 iconW/iconH 必须等于此值
+   * （桥接层按 argb.length === w*h 校验，不等则整张纹理被丢弃 → 点回退成屏幕固定圆）。
+   * 内核把 iconW 当「屏幕固定显示像素」用，故 64 即最终显示宽度（≈21dp@3x，Android 的
+   * ic_marker_* 矢量 drawable 固有 24dp=72px，量级一致）。
+   */
   static readonly SIZE: number = 64;
 
   /** 可选图标清单（样式对话框下拉用，顺序即显示顺序） */

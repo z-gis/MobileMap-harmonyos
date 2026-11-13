@@ -158,6 +158,8 @@ export class MeasureRecord {
   /** 面是否闭合 */
   closed: boolean = false;
   lineWidth: number = MeasureRecord.DEFAULT_LINE_WIDTH;
+  /** 备注 */
+  remark: string = '';
 
   toJsonObject(): JsonObject {
     const o: JsonObject = {
@@ -166,6 +168,7 @@ export class MeasureRecord {
       'date': this.date,
       'type': this.type,
       'result': this.result,
+      'remark': nullIfEmpty(this.remark),
       'color': nullIfEmpty(this.color),
       'hidden': this.hidden,
       'closed': this.closed,
@@ -186,6 +189,7 @@ export class MeasureRecord {
     m.date = jStr(o, 'date');
     m.type = jStr(o, 'type');
     m.result = jStr(o, 'result');
+    m.remark = jStrOrEmpty(o, 'remark');
     m.color = jStrOrEmpty(o, 'color');
     m.hidden = jBool(o, 'hidden', false);
     m.closed = jBool(o, 'closed', false);
@@ -240,6 +244,8 @@ export class PhotoRecord {
   visible: boolean = true;
   /** 所属分组，UNGROUPED_ID 未分组 */
   groupId: number = PhotoRecord.UNGROUPED_ID;
+  /** 备注 */
+  remark: string = '';
   attachments: PhotoAttachment[] = [];
 
   /** 主照片路径（首个附件），无附件返回 '' */
@@ -261,6 +267,7 @@ export class PhotoRecord {
       'timestamp': this.timestamp,
       'visible': this.visible,
       'groupId': this.groupId,
+      'remark': nullIfEmpty(this.remark),
       'attachments': arr,
     };
     return o;
@@ -280,6 +287,7 @@ export class PhotoRecord {
     p.timestamp = jNum(o, 'timestamp');
     p.visible = jBool(o, 'visible', true);
     p.groupId = jNum(o, 'groupId', PhotoRecord.UNGROUPED_ID);
+    p.remark = jStrOrEmpty(o, 'remark');
     const arr: Object[] | null = jArr(o['attachments']);
     if (arr !== null) {
       for (let i = 0; i < arr.length; i++) {

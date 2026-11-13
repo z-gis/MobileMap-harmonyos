@@ -1,0 +1,20 @@
+{
+  "string": [
+    {
+      "name": "module_desc",
+      "value": "调查宝桌面端（内业成果处理）"
+    },
+    {
+      "name": "PcAbility_desc",
+      "value": "调查宝：地图工作台（PC）"
+    },
+    {
+      "name": "PcAbility_label",
+      "value": "调查宝"
+    },
+    {
+      "name": "perm_net_reason",
+      "value": "用于加载在线地图瓦片"
+    }
+  ]
+}

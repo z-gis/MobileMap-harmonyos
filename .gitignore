@@ -10,3 +10,8 @@ oh_modules
 /.clang-tidy
 **/.test
 /.appanalyzer
+# 版本化交付包（build-harmonyos.ps1 产出的 mobilemap-v<version>-<mode>.hap）
+/dist
+# DevEco 本机签名材料（含口令）与构建缓存
+/material
+/.cache

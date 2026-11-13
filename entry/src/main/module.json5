@@ -95,6 +95,9 @@
           "location"
         ],
         "exported": true,
+        // 单实例（对齐 Android MainActivity 的 singleTask）：外部打开复用运行中的地图，
+        // 不再起第二个 NativeMapView 实例；重复拉起经 onNewWant 承接文件 URI
+        "launchType": "singleton",
         "skills": [
           {
             "entities": [
@@ -102,6 +105,31 @@
             ],
             "actions": [
               "ohos.want.action.home"
+            ]
+          },
+          // 外部打开（文件管理「打开方式」候选按安装时解析的本声明匹配，改后必须卸载重装）：
+          // 匹配口径是 UTD/MIME，不是后缀——Android 侧的 pathPattern 在鸿蒙 file scheme 下无对应物。
+          // kmz 的新预置 UTD general.kmz 需 OpenHarmony 6.1+，故先用 MIME 兜底（对齐 Android manifest）。
+          {
+            "actions": [
+              "ohos.want.action.viewData"
+            ],
+            "uris": [
+              {
+                "scheme": "file",
+                "type": "general.zip-archive",
+                "linkFeature": "FileOpen"
+              },
+              {
+                "scheme": "file",
+                "type": "application/zip",
+                "linkFeature": "FileOpen"
+              },
+              {
+                "scheme": "file",
+                "type": "application/vnd.google-earth.kmz",
+                "linkFeature": "FileOpen"
+              }
             ]
           }
         ]

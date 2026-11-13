@@ -16,6 +16,7 @@ import { ProjectManager } from '../project/ProjectManager';
 import { MeasureRecord, PhotoRecord, Project, SurveyPlot, TrackRecord } from '../project/ProjectModels';
 import { MapStyle } from './MapStyle';
 import { FeatureIcons } from '../vector/FeatureIcons';
+import { AndroidIcons, IconBitmap } from '../vector/AndroidIcons';
 
 const TAG: string = 'BusinessOverlayManager';
 
@@ -281,8 +282,24 @@ export class BusinessOverlayManager {
   }
 
   /**
-   * 拍照点位 → 一点叠加层（全部可见点合一层）：图标程序化生成 camera 形状 billboard，
-   * fid = 点位主键（供交互查附件）；名称标注受 showPhotoName 控制、空名回退「拍照(附件数)」。
+   * 点位图标像素与宽高（拍照 / 样地共用）：优先 rawfile 里与 Android drawable-nodpi 同一张 PNG，
+   * 解码失败才回退 FeatureIcons 程序化形状。
+   * 宽高必须是「像素数组自身的分辨率」：桥接层 iconArgbToRgba 按 argb.length === w*h 校验，
+   * 不等就整张纹理丢弃、点回退成屏幕固定圆（此前传 radiusDp*2 即栽在这里，所以看到的是橙点而非图标）；
+   * 内核又用同一个宽高作屏幕显示尺寸，故传真实像素值同时保证「画得出来」和「大小与 Android 一致」。
+   */
+  private iconOf(pngName: string, fallbackKey: string, fallbackArgb: number): IconBitmap {
+    const decoded: IconBitmap | undefined = AndroidIcons.of(this.ctx, pngName);
+    if (decoded !== undefined) {
+      return decoded;
+    }
+    return new IconBitmap(FeatureIcons.pixels(fallbackKey, fallbackArgb),
+      FeatureIcons.SIZE, FeatureIcons.SIZE);
+  }
+
+  /**
+   * 拍照点位 → 一点叠加层（全部可见点合一层）：图标用 Android 同图 ic_media（rawfile 解码为
+   * billboard 像素），fid = 点位主键（供交互查附件）；名称标注受 showPhotoName 控制、空名回退「拍照(附件数)」。
    * 分组可见性已由管理界面写入各点 visible，故此处仅过滤 visible。
    */
   private addMediaOverlay(photos: PhotoRecord[], showName: boolean): void {
@@ -291,9 +308,8 @@ export class BusinessOverlayManager {
       return;
     }
     const style: VectorStyle = MapStyle.pointStyle(MapStyle.DEFAULT_LINE_COLOR, MapStyle.PHOTO_POINT_RADIUS_DP);
-    const icon: number[] = FeatureIcons.pixels(FeatureIcons.DEFAULT_KEY, MapStyle.PHOTO_ICON_COLOR);
-    const idx: number = this.view.addOverlayLayer(style, icon,
-      MapStyle.PHOTO_POINT_RADIUS_DP * 2, MapStyle.PHOTO_POINT_RADIUS_DP * 2);
+    const icon: IconBitmap = this.iconOf(AndroidIcons.MEDIA, FeatureIcons.DEFAULT_KEY, MapStyle.PHOTO_ICON_COLOR);
+    const idx: number = this.view.addOverlayLayer(style, icon.argb, icon.w, icon.h);
     if (idx < 0) {
       return;
     }
@@ -331,9 +347,8 @@ export class BusinessOverlayManager {
       return;
     }
     const style: VectorStyle = MapStyle.pointStyle(MapStyle.SURVEY_COLOR, MapStyle.SURVEY_POINT_RADIUS_DP);
-    const icon: number[] = FeatureIcons.pixels(FeatureIcons.SQUARE, MapStyle.SURVEY_COLOR);
-    const idx: number = this.view.addOverlayLayer(style, icon,
-      MapStyle.SURVEY_POINT_RADIUS_DP * 2, MapStyle.SURVEY_POINT_RADIUS_DP * 2);
+    const icon: IconBitmap = this.iconOf(AndroidIcons.SAMPLE, FeatureIcons.SQUARE, MapStyle.SURVEY_COLOR);
+    const idx: number = this.view.addOverlayLayer(style, icon.argb, icon.w, icon.h);
     if (idx < 0) {
       return;
     }

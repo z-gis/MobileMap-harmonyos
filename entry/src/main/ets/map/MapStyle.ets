@@ -31,8 +31,7 @@ export class MapStyle {
   // ── 轨迹 ─────────────────────────────────────────────────────────
   static readonly TRACK_ACTIVE_COLOR: number = 0xFFFF5933;
   static readonly TRACK_ACTIVE_WIDTH: number = 4;
-  /** 轨迹采集最小间距（米）：小于该距离的定位点丢弃，抑制 GPS 抖动毛刺 */
-  static readonly MIN_TRACK_POINT_DISTANCE_METERS: number = 5;
+  // 轨迹点最小间距已迁至采集门控 TrackPointGate.MIN_DISTANCE_METERS（门控统一持有五判据阈值）
 
   // ── 业务点（照片 / 样地）──────────────────────────────────────────
   static readonly PHOTO_POINT_RADIUS_DP: number = 6;
@@ -55,8 +54,12 @@ export class MapStyle {
   static readonly SELECT_LINE_WIDTH: number = 3.0;
   static readonly SELECT_POINT_RADIUS: number = 7.0;
 
-  /** 中心十字线颜色（屏幕坐标绘制，非渲染内核对象） */
-  static readonly CENTER_CROSS_COLOR: string = '#FF3DA5FF';
+  /**
+   * 中心十字线颜色（屏幕坐标绘制，非渲染内核对象）。
+   * 与 Android control/CrossView.kt 同口径：`Color.RED`（横竖两条红线交于视图中心）。
+   * 本端此前用 #FF3DA5FF（与定位蓝点同色），属未对齐，现改回红。
+   */
+  static readonly CENTER_CROSS_COLOR: string = '#FFFF0000';
 
   /**
    * 文档样式覆盖 → 渲染样式。

@@ -1,4 +1,4 @@
-// ProjectManager.ets —— 工程管理器（对应 Android project/ProjectManager.kt，0.4.0.4 增量落盘版）。
+// ProjectManager.ets —— 工程管理器（对应 Android project/ProjectManager.kt，0.4.1.1 增量落盘版）。
 //
 // 工程 gpkg 是采集数据（轨迹/测量/拍照/样地）的唯一数据本体，旧工作库
 // （map.db / media.db / sample_survey.db）已废弃，仅在首启由 LegacyMigration
@@ -8,7 +8,9 @@
 //  - 工程文件存应用沙箱 <filesDir>/projects/（fs API 自由读写；Android 为公共目录 /调查宝/projects/）；
 //  - 增量写是同步 NAPI 调用（引擎侧 SQLite 直写），无 Android 的后台串行队列，
 //    故 saveNow 语义简化为「元数据 syncMeta 落盘」，保持同名便于与 Android 对照；
-//  - 全异步风格与 db/DbKit.ets 一致（async/await，UI 侧 await）。
+//  - 全异步风格与 db/DbKit.ets 一致（async/await，UI 侧 await）；
+//  - 合并的照片本体无 Android 的 cache/merge_tmp 暂存环节：BLOB 逐张从源库直读直写目标库
+//    （见 mergeIntoCurrent），Android 的 cleanupMergeTempFiles 在鸿蒙侧无对应需求。
 //
 // 照片策略：照片本体增量写入 gpkg BLOB（主照片 photos.photo_data，其余附件 photo_att_data
 // 附加表），源文件在入库成功后由 sweepPhotoFiles 退役，不再长期保留。
@@ -21,7 +23,7 @@ import { AppDirs } from '../common/AppDirs';
 import { Prefs } from '../common/Prefs';
 import { GeoCalc, LatLng } from '../common/GeoCalc';
 import { GpkgDml } from './GpkgDml';
-import { MeasureRecord, MediaGroupRecord, PhotoAttachment, PhotoRecord, Project, SurveyPlot, TrackRecord } from './ProjectModels';
+import { MeasureRecord, MediaGroupRecord, PhotoAttachment, PhotoRecord, Project, SurveyPlot, SurveyRow, TrackRecord } from './ProjectModels';
 import { LegacyMigration } from './LegacyMigration';
 
 const TAG: string = 'ProjectManager';
@@ -37,6 +39,38 @@ export class ProjectInfo {
   lastModified: number = 0;
   displaySize: string = '';
   displayDate: string = '';
+}
+
+/**
+ * 合并数据量统计（对应 Android ProjectManager.MergeResult）：合并前作预览（statsOf），
+ * 合并后作结果（mergeIntoCurrent），各字段口径一致 = 并入当前工程的条数。
+ * groups 只计新建分组（同名分组归并不产生新组）。
+ */
+export class MergeResult {
+  tracks: number = 0;
+  measures: number = 0;
+  photos: number = 0;
+  attachments: number = 0;
+  groups: number = 0;
+  plots: number = 0;
+
+  /** 源工程无可并数据 */
+  get isEmpty(): boolean {
+    return this.tracks + this.measures + this.photos + this.plots === 0;
+  }
+
+  /** 单行文案：轨迹 3 · 测量 1 · 拍照点位 5（照片 7 张）· 新建分组 2 · 样地 4 */
+  describe(): string {
+    let s: string = `轨迹 ${this.tracks} · 测量 ${this.measures} · 拍照点位 ${this.photos}`;
+    if (this.attachments > 0) {
+      s += `（照片 ${this.attachments} 张）`;
+    }
+    if (this.groups > 0) {
+      s += ` · 新建分组 ${this.groups}`;
+    }
+    s += ` · 样地 ${this.plots}`;
+    return s;
+  }
 }
 
 export class ProjectManager {
@@ -64,7 +98,7 @@ export class ProjectManager {
 
   private constructor(ctx: common.Context) {
     this.ctx = ctx;
-    this.projectsDir = AppDirs.ensureDir(`${ctx.filesDir}/projects`);
+    this.projectsDir = AppDirs.projectsDir();
   }
 
   /** 取单例（后续 UI 接线统一经此入口） */
@@ -251,14 +285,21 @@ export class ProjectManager {
     const p: Project | null = Project.parse(json);
     if (p === null) {
       AppLog.e(`${TAG} readProject: ${filePath} JSON 解析失败`);
+      return null;
+    }
+    // 工程名以文件名为准：meta 缺 name 或外部拷贝/改名时回填文件名，否则 currentProjectPath
+    // 会按空名推导成「未命名工程.gpkg」，增量读写落到不存在的文件（照片 BLOB 读不到）。
+    const fileBase: string = ProjectManager.baseNameNoExt(filePath);
+    if (p.name !== fileBase) {
+      AppLog.i(`${TAG} readProject: 工程名回填 '${p.name}' -> '${fileBase}'（与文件名对齐）`);
+      p.name = fileBase;
     }
     return p;
   }
 
   /**
    * 打开工程：当前工程先落盘 → 读 gpkg 切换 currentProject → 记为最近工程 → 就绪检查。
-   * 工程名以文件名为准：gpkg 内 name 与文件名不一致（外部拷贝/改名所致）时回填文件名，
-   * 否则按内部 name 落盘会另生成新文件，同名数据分叉成两份。
+   * 工程名以文件名为准（readProject 内回填），避免按内部 name 落盘另生成新文件、同名数据分叉。
    */
   async openProject(filePath: string): Promise<Project | null> {
     const cur: Project | null = this.cur;
@@ -267,11 +308,6 @@ export class ProjectManager {
     }
     const p: Project | null = await this.readProject(filePath);
     if (p !== null) {
-      const fileBase: string = ProjectManager.baseNameNoExt(filePath);
-      if (p.name !== fileBase) {
-        AppLog.i(`${TAG} openProject: 工程名回填 '${p.name}' -> '${fileBase}'（与文件名对齐）`);
-        p.name = fileBase;
-      }
       this.cur = p;
       await this.rememberCurrent(filePath);
       await this.ensureProjectReady(p, filePath);
@@ -365,6 +401,343 @@ export class ProjectManager {
     }
     AppLog.i(`${TAG} renameProject: ${oldFileName} -> ${newName} ${ok}`);
     return ok;
+  }
+
+  // ── 复制 / 备份 ──
+
+  /**
+   * 复制工程文件为 new 名的新工程（对应 Android duplicateProject）。
+   * 当前工程先落盘保证复制到最新；目标同名直接拒绝（Android 靠 copyTo(overwrite=false) 抛异常，
+   * 鸿蒙侧显式 exists 检查，语义相同——绝不覆盖既有工程）。
+   */
+  async duplicateProject(fileName: string, newName: string): Promise<boolean> {
+    const cur: Project | null = this.cur;
+    if (cur !== null && fileName === this.currentFileName()) {
+      await this.saveNowProject(cur);
+    }
+    const src: string = `${this.projectsDir}/${fileName}`;
+    const dst: string = this.filePathFor(newName);
+    if (!AppDirs.exists(src) || AppDirs.exists(dst)) {
+      AppLog.w(`${TAG} duplicateProject: 拒绝（源缺失或同名已存在） ${fileName} -> ${newName}`);
+      return false;
+    }
+    try {
+      fs.copyFileSync(src, dst);
+      AppLog.i(`${TAG} duplicateProject: ${fileName} -> ${dst}`);
+      return true;
+    } catch (e) {
+      AppLog.e(`${TAG} duplicateProject: 复制失败 ${fileName}`, e);
+      return false;
+    }
+  }
+
+  /**
+   * 备份当前工程：先同步元数据落盘保证备份为最新，再复制 gpkg 到 backups/（文件名带时间戳，
+   * 不进工程列表）。返回备份文件绝对路径，失败回 ''。
+   * 平台差异：Android 落公共目录 /sdcard/调查宝/backups（文件管理器可直接取），鸿蒙沙箱无
+   * 公共目录写权限，落 <filesDir>/调查宝/backups，取出备份走工程管理「分享」。
+   */
+  async backupCurrentProject(): Promise<string> {
+    const p: Project | null = this.cur;
+    if (p === null) {
+      return '';
+    }
+    if (!(await this.saveNowProject(p))) {
+      AppLog.w(`${TAG} backupCurrentProject: 落盘失败，放弃备份`);
+      return '';
+    }
+    return await this.copyToBackup(this.currentProjectPath,
+      ProjectManager.sanitizeFileName(p.name.length > 0 ? p.name : '未命名工程'));
+  }
+
+  /** 备份指定工程文件（当前/非当前工程通用）；返回备份文件绝对路径，失败回 '' */
+  async backupProjectFile(fileName: string): Promise<string> {
+    const base: string = fileName.replace(/\.gpkg$/, '');
+    return await this.copyToBackup(`${this.projectsDir}/${fileName}`, base);
+  }
+
+  /** 备份落盘：src → backups/<base>_<yyyy-MM-dd_HH-mm-ss>.gpkg（同名不覆盖：秒级时间戳已足够唯一） */
+  private async copyToBackup(srcPath: string, baseName: string): Promise<string> {
+    if (!AppDirs.exists(srcPath)) {
+      AppLog.w(`${TAG} backup: 源文件不存在 ${srcPath}`);
+      return '';
+    }
+    const dst: string = `${AppDirs.backupDir()}/${baseName}_${AppDirs.stamp(Date.now())}.gpkg`;
+    try {
+      fs.copyFileSync(srcPath, dst);
+      AppLog.i(`${TAG} backup: ${srcPath} -> ${dst}`);
+      return dst;
+    } catch (e) {
+      AppLog.e(`${TAG} backup: 复制失败 ${srcPath}`, e);
+      return '';
+    }
+  }
+
+  // ── 工程合并（把一个工程的采集数据并入当前工程）──
+
+  /**
+   * 只读预估并入量（不写库、不改模型），供合并确认对话框展示。
+   * groups 按 findGroupForMerge 口径剔除将被同名归并的组，与 mergeIntoCurrent 结果一致。
+   */
+  statsOf(source: Project): MergeResult {
+    const res: MergeResult = new MergeResult();
+    res.tracks = source.tracks.length;
+    res.measures = source.measures.length;
+    res.photos = source.photos.length;
+    let attachments: number = 0;
+    for (let i = 0; i < source.photos.length; i++) {
+      attachments += source.photos[i].attachments.length;
+    }
+    res.attachments = attachments;
+    let groups: number = 0;
+    for (let i = 0; i < source.mediaGroups.length; i++) {
+      if (this.findGroupForMerge(source.mediaGroups[i].name) === null) {
+        groups++;
+      }
+    }
+    res.groups = groups;
+    res.plots = source.surveyPlots.length;
+    return res;
+  }
+
+  /** 分组按名称归并：当前工程已有同名（去空白）分组时沿用该组 */
+  private findGroupForMerge(name: string): MediaGroupRecord | null {
+    const n: string = name.trim();
+    const p: Project | null = this.cur;
+    if (n.length === 0 || p === null) {
+      return null;
+    }
+    for (let i = 0; i < p.mediaGroups.length; i++) {
+      if (p.mediaGroups[i].name.trim() === n) {
+        return p.mediaGroups[i];
+      }
+    }
+    return null;
+  }
+
+  /**
+   * 把 source（由 readProject 读入的另一工程副本）的采集数据并入当前工程。
+   *
+   * 并表规则（与 Android mergeIntoCurrent 逐条一致）：
+   *  - 记录 id 在当前工程内重新取号（nextId），与源工程 id 无关，gpkg fid 不冲突；
+   *  - 拍照分组按名称归并（findGroupForMerge），点位经「源组 id → 目标组 id」映射挂到对应组；
+   *  - 样地走 saveSurveyPlot，同小班内重号自动续排；
+   *  - 工程名/描述/图层引用（layerRefs）不参与合并——图层属文档配置，不属采集数据；
+   *  - 源工程文件与数据不做任何改动；完成后由调用方 saveNow 刷新元数据。
+   *
+   * 平台差异：Android 主线程并内存 + 后台串行队列落增量 DML，照片本体先 stageMergePhotos 暂存
+   * 到 cache/merge_tmp 再由队列搬运；鸿蒙增量写本身是同步 NAPI，故整段 async 顺序 await，
+   * 照片本体逐张「源库 BLOB → 目标库 BLOB」直搬，无暂存文件与清理步骤。UI 侧 await 期间给进度提示。
+   *
+   * 源即当前工程、或无当前工程时返回 null（不产生半并状态）。
+   */
+  async mergeIntoCurrent(source: Project, sourceFilePath: string): Promise<MergeResult | null> {
+    const target: Project | null = this.cur;
+    if (target === null) {
+      AppLog.w(`${TAG} mergeIntoCurrent: 无当前工程，拒绝`);
+      return null;
+    }
+    if (source === target) {
+      AppLog.w(`${TAG} mergeIntoCurrent: 源即当前工程，拒绝`);
+      return null;
+    }
+    const targetPath: string = this.currentProjectPath;
+    const res: MergeResult = new MergeResult();
+
+    // ── 分组先并：后续点位要按名称归并结果拿目标组 id ──
+    const groupIdMap: Map<number, number> = new Map<number, number>();
+    for (let i = 0; i < source.mediaGroups.length; i++) {
+      const g: MediaGroupRecord = source.mediaGroups[i];
+      const exist: MediaGroupRecord | null = this.findGroupForMerge(g.name);
+      if (exist !== null) {
+        groupIdMap.set(g.id, exist.id);
+        continue;
+      }
+      const ng: MediaGroupRecord = new MediaGroupRecord();
+      ng.id = ProjectManager.nextId(target.mediaGroups.map((it: MediaGroupRecord): number => it.id));
+      ng.name = g.name;
+      ng.createdTime = g.createdTime;
+      ng.visible = g.visible;
+      target.mediaGroups.push(ng);
+      groupIdMap.set(g.id, ng.id);
+      res.groups++;
+      if (!(await GpkgDml.insertGroup(targetPath, ng.toJson()))) {
+        AppLog.e(`${TAG} mergeIntoCurrent: 分组落盘失败 ${ng.name}`);
+      }
+    }
+
+    // ── 轨迹 ──
+    for (let i = 0; i < source.tracks.length; i++) {
+      const t: TrackRecord = source.tracks[i];
+      const r: TrackRecord = new TrackRecord();
+      r.id = ProjectManager.nextId(target.tracks.map((it: TrackRecord): number => it.id));
+      r.name = t.name;
+      r.date = t.date;
+      r.color = t.color;
+      r.hidden = t.hidden;
+      r.lineWidth = t.lineWidth;
+      r.points = ProjectManager.copyPoints(t.points);
+      target.tracks.push(r);
+      if (await GpkgDml.insertTrack(targetPath, r.toJson()) <= 0) {
+        AppLog.e(`${TAG} mergeIntoCurrent: 轨迹落盘失败 ${r.name}`);
+      }
+      res.tracks++;
+    }
+
+    // ── 测量 ──
+    for (let i = 0; i < source.measures.length; i++) {
+      const m: MeasureRecord = source.measures[i];
+      const r: MeasureRecord = new MeasureRecord();
+      r.id = ProjectManager.nextId(target.measures.map((it: MeasureRecord): number => it.id));
+      r.name = m.name;
+      r.date = m.date;
+      r.type = m.type;
+      r.result = m.result;
+      r.color = m.color;
+      r.hidden = m.hidden;
+      r.closed = m.closed;
+      r.lineWidth = m.lineWidth;
+      r.points = ProjectManager.copyPoints(m.points);
+      target.measures.push(r);
+      if (await GpkgDml.insertMeasure(targetPath, r.toJson()) <= 0) {
+        AppLog.e(`${TAG} mergeIntoCurrent: 测量落盘失败 ${r.name}`);
+      }
+      res.measures++;
+    }
+
+    // ── 拍照点位（附件记录先落，本体逐张从源库搬 BLOB）──
+    for (let i = 0; i < source.photos.length; i++) {
+      const ph: PhotoRecord = source.photos[i];
+      const r: PhotoRecord = new PhotoRecord();
+      r.id = ProjectManager.nextId(target.photos.map((it: PhotoRecord): number => it.id));
+      r.name = ph.name;
+      r.lat = ph.lat;
+      r.lon = ph.lon;
+      r.alt = ph.alt;
+      r.timestamp = ph.timestamp;
+      r.visible = ph.visible;
+      const mappedGroup: number | undefined = groupIdMap.get(ph.groupId);
+      r.groupId = mappedGroup === undefined ? PhotoRecord.UNGROUPED_ID : mappedGroup;
+      for (let idx = 0; idx < ph.attachments.length; idx++) {
+        const a: PhotoAttachment = ph.attachments[idx];
+        r.attachments.push(new PhotoAttachment(a.name, a.path, a.time));
+      }
+      target.photos.push(r);
+      if (await GpkgDml.insertPhoto(targetPath, r.toJson()) <= 0) {
+        AppLog.e(`${TAG} mergeIntoCurrent: 拍照点位落盘失败 ${r.name}`);
+        continue;
+      }
+      res.photos++;
+      res.attachments += r.attachments.length;
+      // insertPhoto 不写附件列（native 只收 name/坐标/时间/分组），本体与附件 JSON 在此补写，
+      // 与日常拍照 addPhotoAttachment → updatePhoto 的落库次序一致
+      for (let idx = 0; idx < r.attachments.length; idx++) {
+        const bytes: ArrayBuffer | null =
+          await ProjectManager.readMergePhoto(sourceFilePath, ph.id, idx, r.attachments[idx].path);
+        if (bytes === null) {
+          AppLog.w(`${TAG} mergeIntoCurrent: 源照片无本体，只并附件记录 fid=${ph.id} idx=${idx}`);
+          continue;
+        }
+        if (!(await GpkgDml.addPhotoAttachment(targetPath, r.id, idx, bytes))) {
+          AppLog.e(`${TAG} mergeIntoCurrent: 照片入库失败 id=${r.id} idx=${idx}`);
+        }
+      }
+      const atts: Object[] = [];
+      for (let idx = 0; idx < r.attachments.length; idx++) {
+        atts.push(r.attachments[idx].toJsonObject());
+      }
+      const o: Record<string, Object | null> = {
+        'attachments': atts,
+        'photo_path': r.photoPath,
+      };
+      if (!(await GpkgDml.updatePhoto(targetPath, r.id, JSON.stringify(o)))) {
+        AppLog.e(`${TAG} mergeIntoCurrent: 附件列写入失败 id=${r.id}`);
+      }
+    }
+
+    // ── 样地调查（saveSurveyPlot 重新取号 + 同小班续排编号）──
+    for (let i = 0; i < source.surveyPlots.length; i++) {
+      if (await this.saveSurveyPlot(ProjectManager.copySurveyPlot(source.surveyPlots[i])) !== null) {
+        res.plots++;
+      }
+    }
+
+    AppLog.i(`${TAG} mergeIntoCurrent: 并入 '${source.name}' -> '${target.name}' ${res.describe()}`);
+    return res;
+  }
+
+  /**
+   * 取源工程某附件的照片本体：gpkg BLOB 优先，BLOB 缺失退回磁盘原件
+   * （未入库的老数据/迁移中断）。两边都没有返回 null，只并附件记录不显示图，
+   * 与 Android stageMergePhotos 的兜底口径一致。
+   */
+  private static async readMergePhoto(sourcePath: string, fid: number, idx: number,
+    filePath: string): Promise<ArrayBuffer | null> {
+    const blob: ArrayBuffer | null = await GpkgDml.readPhotoBlob(sourcePath, fid, idx);
+    if (blob !== null && blob.byteLength > 0) {
+      return blob;
+    }
+    if (filePath.length === 0 || !AppDirs.exists(filePath)) {
+      return null;
+    }
+    try {
+      const st = fs.statSync(filePath);
+      if (st.size <= 0) {
+        return null;
+      }
+      const buf: ArrayBuffer = new ArrayBuffer(st.size);
+      const f = fs.openSync(filePath, fs.OpenMode.READ_ONLY);
+      try {
+        fs.readSync(f.fd, buf);
+      } finally {
+        fs.closeSync(f);
+      }
+      return buf;
+    } catch (e) {
+      AppLog.e(`${TAG} readMergePhoto: 读源照片文件失败 ${filePath}`, e);
+      return null;
+    }
+  }
+
+  /** 点串深拷贝（[lat,lon,alt] 行数组逐个复制，避免与源工程共享引用） */
+  private static copyPoints(points: number[][]): number[][] {
+    const out: number[][] = [];
+    for (let i = 0; i < points.length; i++) {
+      out.push(points[i].slice());
+    }
+    return out;
+  }
+
+  /** 样地深拷贝（id 置 0 交由 saveSurveyPlot 重新取号；明细行整组带走，updatedAt 留空由保存刷新） */
+  private static copySurveyPlot(src: SurveyPlot): SurveyPlot {
+    const r: SurveyPlot = new SurveyPlot();
+    r.name = src.name;
+    r.plotType = src.plotType;
+    r.points = ProjectManager.copyPoints(src.points);
+    r.sourcePath = src.sourcePath;
+    r.sourceFid = src.sourceFid;
+    r.compartmentNo = src.compartmentNo;
+    r.plotNo = src.plotNo;
+    r.averageTreeHeight = src.averageTreeHeight;
+    r.canopyDensity = src.canopyDensity;
+    r.cornerCoordinates = src.cornerCoordinates;
+    r.createdAt = src.createdAt;
+    for (let i = 0; i < src.rows.length; i++) {
+      const row: SurveyRow = src.rows[i];
+      const nr: SurveyRow = new SurveyRow();
+      nr.id = row.id;
+      nr.sortNo = row.sortNo;
+      nr.treeSpecies = row.treeSpecies;
+      nr.dbh = row.dbh;
+      nr.category = row.category;
+      nr.thinningMethod = row.thinningMethod;
+      nr.remark = row.remark;
+      r.rows.push(nr);
+    }
+    for (let i = 0; i < src.photoPaths.length; i++) {
+      r.photoPaths.push(src.photoPaths[i]);
+    }
+    return r;
   }
 
   // ── 记录 ID 分配（gpkg 落表为 fid，须 >0 且集合内唯一）──
@@ -529,6 +902,57 @@ export class ProjectManager {
     }
   }
 
+  /**
+   * 测量改名（对应 Android updateMeasureName + GeoPackageDml.updateMeasureName）。
+   *
+   * 平台差异：Android 走 SQLite 直写 name 列；引擎侧 gpkgUpdateMeasure 只回写 color/lineWidth
+   * （见 GlobeCore geopackage_core.h「更新测量样式」注释），故鸿蒙改名走「删行 + 按原 fid 整行重写」：
+   * gpkgInsertMeasure 对 id>0 显式 SetFID，name/date/type/result/color/closed/线宽与几何原样落回，
+   * fid 不变（样地、图层引用等外部 id 关系不受影响）。
+   * 兜底：删行成功但插行失败时整文件重建（内存模型已含新名），不把测量丢在库里。
+   */
+  async updateMeasureName(id: number, name: string): Promise<boolean> {
+    const p: Project | null = this.cur;
+    const m: MeasureRecord | null = this.findMeasure(id);
+    if (p === null || m === null) {
+      return false;
+    }
+    m.name = name;
+    const filePath: string = this.currentProjectPath;
+    if (!(await GpkgDml.deleteMeasure(filePath, id))) {
+      AppLog.e(`${TAG} updateMeasureName: 删行失败 id=${id}`);
+      return false;
+    }
+    if (await GpkgDml.insertMeasure(filePath, m.toJson()) > 0) {
+      return true;
+    }
+    AppLog.e(`${TAG} updateMeasureName: 整行重写失败，退回整文件重建 id=${id}`);
+    return await this.writeProjectFile(p, filePath);
+  }
+
+  /**
+   * 测量改备注（同 updateMeasureName 的「删行 + 整行重写」路径）。
+   * 不走 gpkgUpdateMeasure：它只回写 color/lineWidth，稀疏 remark 键会被忽略。
+   */
+  async updateMeasureRemark(id: number, remark: string): Promise<boolean> {
+    const p: Project | null = this.cur;
+    const m: MeasureRecord | null = this.findMeasure(id);
+    if (p === null || m === null) {
+      return false;
+    }
+    m.remark = remark;
+    const filePath: string = this.currentProjectPath;
+    if (!(await GpkgDml.deleteMeasure(filePath, id))) {
+      AppLog.e(`${TAG} updateMeasureRemark: 删行失败 id=${id}`);
+      return false;
+    }
+    if (await GpkgDml.insertMeasure(filePath, m.toJson()) > 0) {
+      return true;
+    }
+    AppLog.e(`${TAG} updateMeasureRemark: 整行重写失败，退回整文件重建 id=${id}`);
+    return await this.writeProjectFile(p, filePath);
+  }
+
   async updateMeasureStyle(id: number, colorInt: number, lineWidth: number): Promise<void> {
     const m: MeasureRecord | null = this.findMeasure(id);
     if (m !== null) {
@@ -677,6 +1101,15 @@ export class ProjectManager {
     if (ph !== null) {
       ph.visible = visible;
       const o: Record<string, Object | null> = { 'visible': visible };
+      await this.pushPhotoColumns(id, o);
+    }
+  }
+
+  async updatePhotoRemark(id: number, remark: string): Promise<void> {
+    const ph: PhotoRecord | null = this.findPhoto(id);
+    if (ph !== null) {
+      ph.remark = remark;
+      const o: Record<string, Object | null> = { 'remark': remark };
       await this.pushPhotoColumns(id, o);
     }
   }
@@ -883,8 +1316,9 @@ export class ProjectManager {
 
   /**
    * 工程打开/新建后的就绪流程（幂等）：
-   *  1. schema 检查——老库缺列时整文件重建升级；
-   *  2. 移除 RTree 触发器/索引表（GDAL 专属 ST_* 函数纯 SQLite 不可执行）并补建附件 BLOB 附加表；
+   *  1. schema 检查——老库缺列时整文件重建升级（量测/样地的混装单表算齐备，不走重建，见 GpkgDml.schemaCurrent）；
+   *  2. 补建附件 BLOB 附加表、修正几何维度声明，并把混装单表原地迁移为按几何类型拆分的分表
+   *     （ArcMap 只认 gpkg_geometry_columns 的写实类型；Android 侧还额外移除 RTree 触发器）；
    *  3. 照片文件清扫——BLOB 已入库的磁盘原件退役，BLOB 缺失的从文件补收后删原件。
    */
   private async ensureProjectReady(project: Project, filePath: string): Promise<void> {
@@ -949,8 +1383,8 @@ export class ProjectManager {
     return name.replace(/[\\/:*?"<>|]/g, '_');
   }
 
-  /** 文件名（含路径）→ 去目录去扩展名的基础名 */
-  private static baseNameNoExt(filePath: string): string {
+  /** 文件名（含路径）→ 去目录去扩展名的基础名（工程管理页合并/备份提示也用此口径） */
+  static baseNameNoExt(filePath: string): string {
     const slash: number = Math.max(filePath.lastIndexOf('/'), filePath.lastIndexOf('\\'));
     const name: string = slash >= 0 ? filePath.substring(slash + 1) : filePath;
     const dot: number = name.lastIndexOf('.');

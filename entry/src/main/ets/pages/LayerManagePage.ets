@@ -19,7 +19,7 @@ import { ColorHex } from '../common/ColorHex';
 import { PageData, PageKeys } from '../common/PageData';
 import { Theme } from '../common/Theme';
 import { Ui } from '../common/Ui';
-import { LayerInfo, MapDocument, StyleOverride } from '../doc/DocModels';
+import { LayerGroupRecord, LayerInfo, MapDocument, StyleOverride } from '../doc/DocModels';
 import { DocumentListener, DocumentManager } from '../doc/DocumentManager';
 import { FeatureDetailRequest } from '../map/FeaturePickController';
 import { MapServices } from '../map/MapServices';
@@ -27,9 +27,11 @@ import { MapStyle } from '../map/MapStyle';
 import { GdalVectorReader } from '../vector/GdalVectorReader';
 import { VectorFormats } from '../vector/VectorFormats';
 import { LayerLevelDialog } from '../components/LayerLevelDialog';
+import { LayerGroupDialog } from '../components/LayerGroupDialog';
 import { LayerInfoDialog, LayerInfoItem } from '../components/LayerInfoDialog';
 import { LayerStylePreview } from '../components/LayerStylePreview';
 import { MapSourceList } from '../components/MapSourceList';
+import { NameEditDialog } from '../components/NameEditDialog';
 import { SqlQueryDialog } from '../components/SqlQueryDialog';
 import { TitleBar } from '../components/TitleBar';
 import { AddLayerParams } from './RouteParams';
@@ -53,6 +55,15 @@ const SIZE_UNKNOWN: string = '未知';
  * 故每次同步都重建这份视图模型（ForEach 键含全部影响渲染的值，值变即重绘）。
  */
 class LayerRow {
+  /** 节头行（组头）还是图层行 */
+  header: boolean = false;
+  /** 组 id（-1 = 未分组虚拟节）；图层行同样携带，供 ForEach 键与移组回显 */
+  groupId: number = LayerInfo.UNGROUPED_ID;
+  /** 节头：组名 / 成员数 / 整组开关回显 / 折叠态 */
+  groupName: string = '';
+  count: number = 0;
+  allVisible: boolean = true;
+  collapsed: boolean = false;
   name: string = '';
   path: string = '';
   vector: boolean = true;
@@ -77,8 +88,11 @@ class LayerRow {
 
   /** ForEach 键：任一影响显示的值变化即重建该行 */
   key(): string {
+    if (this.header) {
+      return `h|${this.groupId}|${this.groupName}|${this.count}|${this.allVisible}|${this.collapsed}`;
+    }
     return `${this.path}|${this.visible}|${this.selected}|${this.minLevel}|${this.fill}|${this.fillEnabled}`
-      + `|${this.outline}|${this.outlineWidth}|${this.labelField}|${this.name}`;
+      + `|${this.outline}|${this.outlineWidth}|${this.labelField}|${this.name}|${this.groupId}`;
   }
 }
 
@@ -94,10 +108,17 @@ struct LayerManagePage {
   /** MapSourceList 刷新令牌：切页签 / 子页返回时递增触发其重载 */
   @State sourceToken: number = 0;
   @State activeSource: string = '';
+  /**
+   * 折叠的分组 id 集合（含未分组虚拟节 -1；用数组而非 Set：@State 的 Set 变更不触发刷新）。
+   * 与拍照的展开白名单相反：图层管理现状是全展开平铺，默认保持全展开。
+   */
+  @State collapsedIds: number[] = [];
 
   private levelDialog: CustomDialogController | undefined = undefined;
   private sqlDialog: CustomDialogController | undefined = undefined;
   private infoDialog: CustomDialogController | undefined = undefined;
+  private groupDialog: CustomDialogController | undefined = undefined;
+  private moveDialog: CustomDialogController | undefined = undefined;
   private docListener: DocumentListener | undefined = undefined;
 
   aboutToAppear(): void {
@@ -128,14 +149,27 @@ struct LayerManagePage {
   private sync(): void {
     const doc: MapDocument | null = DocumentManager.getInstance().getDocument();
     const out: LayerRow[] = [];
-    if (doc !== null) {
-      if (this.tab === TAB_VECTOR) {
-        for (let i = 0; i < doc.vectorLayers.length; i++) {
-          out.push(this.buildRow(doc.vectorLayers[i], true));
+    if (doc !== null && this.tab !== TAB_MAP_SOURCE) {
+      const vector: boolean = this.tab === TAB_VECTOR;
+      const list: LayerInfo[] = vector ? doc.vectorLayers : doc.rasterLayers;
+      // 无图层且无组时维持空态提示；有组则始终列出（空组也要可管理）
+      if (list.length > 0 || doc.groups.length > 0) {
+        for (let i = 0; i < doc.groups.length; i++) {
+          const g: LayerGroupRecord = doc.groups[i];
+          const members: LayerInfo[] = LayerManagePage.inGroup(list, g.id);
+          // 页签内只显示含本类型成员的组 + 完全空的组（空组两个页签都可管理）
+          if (members.length === 0 && !LayerManagePage.isGroupEmpty(doc, g.id)) {
+            continue;
+          }
+          out.push(this.headerRow(g.id, g.name, members));
+          if (!this.isCollapsed(g.id)) {
+            this.appendLayers(out, members, vector);
+          }
         }
-      } else if (this.tab === TAB_RASTER) {
-        for (let i = 0; i < doc.rasterLayers.length; i++) {
-          out.push(this.buildRow(doc.rasterLayers[i], false));
+        const rest: LayerInfo[] = LayerManagePage.inGroup(list, LayerInfo.UNGROUPED_ID);
+        out.push(this.headerRow(LayerInfo.UNGROUPED_ID, '未分组', rest));
+        if (!this.isCollapsed(LayerInfo.UNGROUPED_ID)) {
+          this.appendLayers(out, rest, vector);
         }
       }
     }
@@ -152,6 +186,58 @@ struct LayerManagePage {
     this.activeSource = DocumentManager.getInstance().activeBaseMap();
   }
 
+  private static inGroup(list: LayerInfo[], groupId: number): LayerInfo[] {
+    const out: LayerInfo[] = [];
+    for (let i = 0; i < list.length; i++) {
+      if (list[i].groupId === groupId) {
+        out.push(list[i]);
+      }
+    }
+    return out;
+  }
+
+  /** 组在矢量 + 栅格两侧都无成员 */
+  private static isGroupEmpty(doc: MapDocument, groupId: number): boolean {
+    return LayerManagePage.inGroup(doc.vectorLayers, groupId).length === 0
+      && LayerManagePage.inGroup(doc.rasterLayers, groupId).length === 0;
+  }
+
+  private headerRow(groupId: number, name: string, members: LayerInfo[]): LayerRow {
+    const row: LayerRow = new LayerRow();
+    row.header = true;
+    row.groupId = groupId;
+    row.groupName = name;
+    row.count = members.length;
+    row.collapsed = this.isCollapsed(groupId);
+    let allVisible: boolean = members.length > 0;
+    for (let i = 0; i < members.length; i++) {
+      allVisible = allVisible && members[i].visible;
+    }
+    row.allVisible = allVisible;
+    return row;
+  }
+
+  private appendLayers(out: LayerRow[], members: LayerInfo[], vector: boolean): void {
+    for (let i = 0; i < members.length; i++) {
+      out.push(this.buildRow(members[i], vector));
+    }
+  }
+
+  private isCollapsed(groupId: number): boolean {
+    return this.collapsedIds.indexOf(groupId) >= 0;
+  }
+
+  private toggleCollapse(groupId: number): void {
+    const idx: number = this.collapsedIds.indexOf(groupId);
+    if (idx >= 0) {
+      this.collapsedIds.splice(idx, 1);
+    } else {
+      this.collapsedIds.push(groupId);
+    }
+    this.collapsedIds = this.collapsedIds.slice();
+    this.sync();
+  }
+
   /** 行视图模型：样式预览色解析链与 Android drawStylePreview 同序 */
   private buildRow(info: LayerInfo, vector: boolean): LayerRow {
     const row: LayerRow = new LayerRow();
@@ -160,6 +246,7 @@ struct LayerManagePage {
     row.vector = vector;
     row.name = LayerManagePage.displayName(path, info.name ?? '');
     row.visible = info.visible;
+    row.groupId = info.groupId;
     const ext: string = VectorFormats.extOf(path);
     row.sqlQueryable = vector && (ext === 'shp' || ext === 'gpkg');
     row.levelVisible = vector;
@@ -293,6 +380,92 @@ struct LayerManagePage {
     });
     this.sync();
     Ui.toast('已从地图移除图层');
+  }
+
+  // ── 分组动作 ────────────────────────────────────────────────────
+
+  private openNewGroup(): void {
+    this.groupDialog = new CustomDialogController({
+      builder: NameEditDialog({
+        title: '新建分组',
+        label: '分组',
+        placeholder: '请输入分组名称',
+        onConfirmName: (name: string): void => {
+          const id: number = DocumentManager.getInstance().addGroup(name);
+          if (id < 0) {
+            Ui.toast('新建分组失败');
+            return;
+          }
+          this.sync();
+          Ui.toast(`已新建分组：${name}`);
+        },
+      }),
+      customStyle: true,
+      alignment: DialogAlignment.Center,
+      autoCancel: true,
+    });
+    this.groupDialog.open();
+  }
+
+  private openRenameGroup(row: LayerRow): void {
+    this.groupDialog = new CustomDialogController({
+      builder: NameEditDialog({
+        title: '重命名分组',
+        label: '分组',
+        initialValue: row.groupName,
+        placeholder: '请输入分组名称',
+        onConfirmName: (name: string): void => {
+          DocumentManager.getInstance().renameGroup(row.groupId, name);
+          this.sync();
+          Ui.toast('已重命名分组');
+        },
+      }),
+      customStyle: true,
+      alignment: DialogAlignment.Center,
+      autoCancel: true,
+    });
+    this.groupDialog.open();
+  }
+
+  private async removeGroup(row: LayerRow): Promise<void> {
+    const ok: boolean = await Ui.confirm('删除分组',
+      `删除分组“${row.groupName}”后，组内图层不会被移除，将移到“未分组”。是否继续？`, '删除');
+    if (!ok) {
+      return;
+    }
+    DocumentManager.getInstance().removeGroup(row.groupId);
+    const idx: number = this.collapsedIds.indexOf(row.groupId);
+    if (idx >= 0) {
+      this.collapsedIds.splice(idx, 1);
+      this.collapsedIds = this.collapsedIds.slice();
+    }
+    this.sync();
+    Ui.toast('已删除分组');
+  }
+
+  /** 整组显隐：扇出写成员 visible（含未分组虚拟节），渲染层不认组 */
+  private toggleGroupVisible(row: LayerRow, visible: boolean): void {
+    DocumentManager.getInstance().setGroupLayersVisible(row.groupId, visible);
+    this.sync();
+  }
+
+  private openMoveGroup(row: LayerRow): void {
+    const doc: MapDocument | null = DocumentManager.getInstance().getDocument();
+    this.moveDialog = new CustomDialogController({
+      builder: LayerGroupDialog({
+        layerName: row.name,
+        currentGroupId: row.groupId,
+        groups: doc === null ? [] : doc.groups,
+        onConfirmGroup: (groupId: number, newGroupName: string): void => {
+          DocumentManager.getInstance().moveLayerToGroup(row.path, row.vector, groupId, newGroupName);
+          this.sync();
+        },
+      }),
+      customStyle: true,
+      alignment: DialogAlignment.Center,
+      autoCancel: true,
+    });
+    this.moveDialog.open();
   }
 
   /** 缩放到图层四至：相机在主地图页，故经登记表驱动，返回地图即见结果 */
@@ -539,7 +712,11 @@ struct LayerManagePage {
           List({ space: Theme.GAP }) {
             ForEach(this.rows, (row: LayerRow): void => {
               ListItem() {
-                this.layerCard(row)
+                if (row.header) {
+                  this.groupCard(row)
+                } else {
+                  this.layerCard(row)
+                }
               }
             }, (row: LayerRow): string => row.key())
           }
@@ -560,23 +737,35 @@ struct LayerManagePage {
     if (this.tab === TAB_MAP_SOURCE) {
       return this.activeSource.length > 0 ? `当前底图：${this.activeSource}` : '当前未选择底图';
     }
-    return `${this.tabLabel(this.tab)}　${this.rows.length} 个`;
+    return `${this.tabLabel(this.tab)}　${this.rows.filter((r: LayerRow): boolean => !r.header).length} 个`;
   }
 
   /** 顶栏动作：地图源页签的「添加」在列表内自带按钮，此处不重复放 */
   @Builder
   barActions() {
     if (this.tab !== TAB_MAP_SOURCE) {
-      Text('+ 导入')
-        .fontSize(Theme.FONT)
-        .fontColor(Theme.TEXT_ON_DARK)
-        .height(30)
-        .padding({ left: 12, right: 12 })
-        .backgroundColor('#33FFFFFF')
-        .borderRadius(15)
-        .onClick((): void => {
-          this.toImport();
-        })
+      Row({ space: 8 }) {
+        Text('新建分组')
+          .fontSize(Theme.FONT_SUB)
+          .fontColor(Theme.TEXT_ON_DARK)
+          .height(30)
+          .padding({ left: 12, right: 12 })
+          .backgroundColor('#33FFFFFF')
+          .borderRadius(15)
+          .onClick((): void => {
+            this.openNewGroup();
+          })
+        Text('+ 导入')
+          .fontSize(Theme.FONT)
+          .fontColor(Theme.TEXT_ON_DARK)
+          .height(30)
+          .padding({ left: 12, right: 12 })
+          .backgroundColor('#33FFFFFF')
+          .borderRadius(15)
+          .onClick((): void => {
+            this.toImport();
+          })
+      }
     }
   }
 
@@ -592,6 +781,81 @@ struct LayerManagePage {
       .borderRadius(Theme.RADIUS)
       .onClick((): void => {
         this.switchTab(index);
+      })
+  }
+
+  /** 组头节：折叠箭头 + 组名 + 计数 + 整组显隐开关；真实组另有改名/删组（照 PhotoPage.groupCard） */
+  @Builder
+  groupCard(row: LayerRow) {
+    Column({ space: 6 }) {
+      Row({ space: 8 }) {
+        SymbolGlyph($r('sys.symbol.chevron_right'))
+          .fontSize(16)
+          .fontColor([Theme.TEXT_SUB])
+          .rotate({ angle: row.collapsed ? 0 : 90 })
+
+        Column({ space: 2 }) {
+          Text(row.groupName)
+            .fontSize(Theme.FONT)
+            .fontColor(Theme.TEXT)
+            .fontWeight(FontWeight.Medium)
+            .maxLines(1)
+            .textOverflow({ overflow: TextOverflow.Ellipsis })
+          Text(row.count > 0 ? `${row.count} 个图层` : '无图层')
+            .fontSize(Theme.FONT_SUB)
+            .fontColor(Theme.TEXT_SUB)
+        }
+        .layoutWeight(1)
+        .alignItems(HorizontalAlign.Start)
+
+        Toggle({ type: ToggleType.Switch, isOn: row.allVisible })
+          .selectedColor(Theme.PRIMARY)
+          .enabled(row.count > 0)
+          .onChange((v: boolean): void => {
+            // 节重建时 Toggle 会按初值回调一次，与当前值相同不写库
+            if (v !== row.allVisible) {
+              this.toggleGroupVisible(row, v);
+            }
+          })
+      }
+      .width('100%')
+      .onClick((): void => {
+        this.toggleCollapse(row.groupId);
+      })
+
+      if (row.groupId !== LayerInfo.UNGROUPED_ID) {
+        Flex({ wrap: FlexWrap.Wrap }) {
+          this.groupChip('改名', Theme.PRIMARY_DARK, (): void => {
+            this.openRenameGroup(row);
+          })
+          this.groupChip('删组', Theme.DANGER, (): void => {
+            this.removeGroup(row);
+          })
+        }
+        .width('100%')
+      }
+    }
+    .width('100%')
+    .alignItems(HorizontalAlign.Start)
+    .padding(10)
+    .backgroundColor(Theme.SUBTLE)
+    .borderRadius(Theme.RADIUS)
+  }
+
+  /** 组头内的药丸：卡片底是 SUBTLE，药丸用 CARD 底区分（actionChip 的 SUBTLE 底会融底） */
+  @Builder
+  groupChip(label: string, color: string, onTap: () => void) {
+    Text(label)
+      .fontSize(Theme.FONT_SUB)
+      .fontColor(color)
+      .textAlign(TextAlign.Center)
+      .height(26)
+      .padding({ left: 8, right: 8 })
+      .backgroundColor(Theme.CARD)
+      .borderRadius(6)
+      .margin({ right: 6, top: 6 })
+      .onClick((): void => {
+        onTap();
       })
   }
 
@@ -637,6 +901,9 @@ struct LayerManagePage {
           }
           this.actionChip('缩放', Theme.TEXT_SUB, (): void => {
             this.zoomToLayer(row);
+          })
+          this.actionChip('分组', Theme.TEXT_SUB, (): void => {
+            this.openMoveGroup(row);
           })
           this.actionChip(row.visible ? '显示' : '隐藏',
             row.visible ? Theme.OK : Theme.TEXT_HINT, (): void => {

@@ -10,7 +10,7 @@
 // GDAL/PROJ 版本经 native 同步可得，故 aboutToAppear 直接回显；驱动清单惰性加载（首次展开才取）。
 
 import { common, Want } from '@kit.AbilityKit';
-import { NativeLayerInfo, NativeSrs } from '@zys/globecore';
+import { NativeLayerInfo, NativeSrs, NativeVersion } from '@zys/globecore';
 import { AppConfig } from '../common/AppConfig';
 import { Theme } from '../common/Theme';
 import { Ui } from '../common/Ui';
@@ -34,6 +34,7 @@ struct AboutPage {
   @StorageProp('bottomInsetVp') bottomInset: number = 0;
   @State gdalVersion: string = '';
   @State projVersion: string = '';
+  @State engineBuildId: string = '';
   @State versionName: string = '';
   @State versionCode: string = '';
   @State driversExpanded: boolean = false;
@@ -46,6 +47,7 @@ struct AboutPage {
   aboutToAppear(): void {
     this.gdalVersion = NativeLayerInfo.getGdalVersion();
     this.projVersion = `${NativeSrs.getProjVersion()}`;
+    this.engineBuildId = NativeVersion.engineBuildId();
     this.updateManager = new UpdateManager(
       this.getUIContext().getHostContext() as common.UIAbilityContext);
     UpdateManager.localVersionName().then((name: string): void => {
@@ -149,6 +151,15 @@ struct AboutPage {
           .borderRadius(Theme.RADIUS)
 
           Text(`proj Version: ${this.projVersion}`)
+            .fontSize(Theme.FONT)
+            .fontColor(Theme.TEXT)
+            .width('100%')
+            .padding(12)
+            .backgroundColor(Theme.CARD)
+            .borderRadius(Theme.RADIUS)
+
+          // 渲染引擎版本 + 构建 ID（随 HAR 编入）：排查「装机产物是否本次引擎改动」看这行
+          Text(`globecore Version: ${this.engineBuildId}`)
             .fontSize(Theme.FONT)
             .fontColor(Theme.TEXT)
             .width('100%')

@@ -484,8 +484,11 @@ export class MapLayerController {
         return -1;
       }
     }
+    // 图标宽高须与 iconArgb 自身的分辨率一致（桥接层按 argb.length===w*h 校验，不符整张纹理丢弃、
+    // 点回退屏幕固定圆）；Android 侧同一位置传 ic_marker_* drawable 解码后的真实尺寸，本端 FeatureIcons
+    // 固定 64×64，故传 FeatureIcons.SIZE。内核按 iconW 作屏幕固定显示像素（64px≈21dp，与 Android 24dp 同级）
     const idx: number = this.view.addVectorLayer(path, style, iconArgb,
-      MapStyle.DEFAULT_POINT_RADIUS_DP * 2, MapStyle.DEFAULT_POINT_RADIUS_DP * 2,
+      FeatureIcons.SIZE, FeatureIcons.SIZE,
       extent, MAX_FEATURES_BUDGET);
     if (idx >= 0) {
       this.view.setVectorMinLevel(idx, Math.max(0, info.effectiveMinDisplayLevel()));

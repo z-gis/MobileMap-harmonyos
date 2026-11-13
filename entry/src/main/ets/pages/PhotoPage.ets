@@ -2,6 +2,7 @@
 //
 // 结构与 Android 一致：按分组分节展示（真实分组在前、未分组虚拟节在后），
 // 节头可折叠 / 整组显隐 / 分享 / 重命名 / 删除，节内是点位行（显隐 / 缩放 / 照片 / 删除）。
+// 折叠状态是「展开白名单」（expandedIds）：进页面默认全部折叠，新建分组自动展开。
 // 与 Android 的差异只在承载形式：Android 是 BottomSheet，鸿蒙侧做成整页；
 // 缩放经 MapServices 直接驱动主地图页相机，看照片改走独立浏览页 PhotoViewerPage。
 //
@@ -66,8 +67,12 @@ struct PhotoPage {
   @StorageProp('bottomInsetVp') bottomInset: number = 0;
   @State rows: MediaRow[] = [];
   @State loaded: boolean = false;
-  /** 折叠的分组 id 集合（用数组而非 Set：@State 的 Set 变更不触发刷新） */
-  @State collapsedIds: number[] = [];
+  /**
+   * 展开的分组 id 集合（含未分组虚拟节；用数组而非 Set：@State 的 Set 变更不触发刷新）。
+   * 语义是「展开白名单」：集合为空 ⇒ 全部分组折叠——分组多时逐个展开找点位反而更慢，
+   * 故进页面默认全收起，靠节头的组名 + 点位数定位后再展开（Android MediaManageDialog 同口径）。
+   */
+  @State expandedIds: number[] = [];
 
   /** 原始记录：分享与编辑需要 attachments / 经纬度等完整字段 */
   private groups: MediaGroupRecord[] = [];
@@ -181,19 +186,28 @@ struct PhotoPage {
     return p.attachments.length > 1 ? `拍照(${p.attachments.length})` : '拍照';
   }
 
+  /** 节头是否折叠：展开白名单外即折叠（默认白名单为空 ⇒ 全部折叠） */
   private isCollapsed(groupId: number): boolean {
-    return this.collapsedIds.indexOf(groupId) >= 0;
+    return this.expandedIds.indexOf(groupId) < 0;
   }
 
   private toggleCollapse(groupId: number): void {
-    const idx: number = this.collapsedIds.indexOf(groupId);
+    const idx: number = this.expandedIds.indexOf(groupId);
     if (idx >= 0) {
-      this.collapsedIds.splice(idx, 1);
+      this.expandedIds.splice(idx, 1);
     } else {
-      this.collapsedIds.push(groupId);
+      this.expandedIds.push(groupId);
     }
-    this.collapsedIds = this.collapsedIds.slice();
+    this.expandedIds = this.expandedIds.slice();
     this.rows = this.buildRows();
+  }
+
+  /** 展开某组（新建分组后立即展开，否则用户会以为没建成） */
+  private expandGroup(groupId: number): void {
+    if (groupId >= 0 && this.expandedIds.indexOf(groupId) < 0) {
+      this.expandedIds.push(groupId);
+      this.expandedIds = this.expandedIds.slice();
+    }
   }
 
   // ── 分组动作 ────────────────────────────────────────────────────
@@ -210,6 +224,8 @@ struct PhotoPage {
               Ui.toast('新建分组失败');
               return;
             }
+            // 默认全折叠，新建的组不展开会让人以为没建成
+            this.expandGroup(id);
             this.reload();
             Ui.toast(`已新建分组：${name}`);
           });
@@ -250,6 +266,12 @@ struct PhotoPage {
       return;
     }
     await ProjectManager.get(this.context()).removeGroup(row.groupId);
+    // 展开白名单里清掉该组（组已不存在，留着会占着一个无主的 id）
+    const idx: number = this.expandedIds.indexOf(row.groupId);
+    if (idx >= 0) {
+      this.expandedIds.splice(idx, 1);
+      this.expandedIds = this.expandedIds.slice();
+    }
     this.reload();
     Ui.toast('已删除分组');
   }

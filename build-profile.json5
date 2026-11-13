@@ -37,6 +37,19 @@
           ]
         }
       ]
+    },
+    {
+      // 桌面端入口（deviceTypes=2in1）：与 entry 同 bundleName，按设备形态分发不同 HAP
+      "name": "entry_pc",
+      "srcPath": "./entry_pc",
+      "targets": [
+        {
+          "name": "default",
+          "applyToProducts": [
+            "default"
+          ]
+        }
+      ]
     }
   ]
 }

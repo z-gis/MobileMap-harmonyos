@@ -9,6 +9,10 @@
 //   调查宝/config  document.json 等配置
 //   调查宝/tiles   瓦片磁盘缓存（按图源缓存键分子目录）
 //   调查宝/log     运行日志
+//   调查宝/backups 工程备份（工程管理的「备份」/合并前自动备份，不进工程列表）
+//
+// 工程文件（.gpkg）不在这棵树内，落 filesDir/projects/（与既有落盘位置一致，见 projectsDir()）；
+// 两处目录的绝对路径由设置页「存储」分组显示给用户。
 import fs from '@ohos.file.fs';
 import { AppLog } from './AppLog';
 
@@ -21,18 +25,23 @@ export class AppDirs {
   static readonly CONFIG: string = 'config';
   static readonly TILES: string = 'tiles';
   static readonly LOG: string = 'log';
+  static readonly BACKUPS: string = 'backups';
 
   /** 沙箱根（filesDir），由 init() 赋值；未初始化前所有取路径方法返回 '' */
   private static base: string = '';
+
+  /** 应用 filesDir 本身（工程 .gpkg 落此下的 projects/），由 init() 赋值 */
+  private static filesRoot: string = '';
 
   /**
    * 初始化并确保全部子目录存在（幂等，须在任何路径访问前调用，见 EntryAbility）。
    * @param filesDir UIAbilityContext.filesDir
    */
   static init(filesDir: string): void {
+    AppDirs.filesRoot = filesDir;
     AppDirs.base = `${filesDir}/${AppDirs.ROOT_NAME}`;
     const subs: string[] = [AppDirs.LAYER, AppDirs.MAP, AppDirs.MEDIA, AppDirs.SAMPLE,
-      AppDirs.CONFIG, AppDirs.TILES, AppDirs.LOG];
+      AppDirs.CONFIG, AppDirs.TILES, AppDirs.LOG, AppDirs.BACKUPS];
     for (let i = 0; i < subs.length; i++) {
       AppDirs.ensureDir(AppDirs.dir(subs[i]));
     }
@@ -71,6 +80,24 @@ export class AppDirs {
     const path = AppDirs.dir(AppDirs.MEDIA);
     AppDirs.ensureDir(path);
     return path;
+  }
+
+  /** 工程备份目录（工程管理「备份」与合并前自动备份落此；不在 projects 下，故不进工程列表） */
+  static backupDir(): string {
+    const path = AppDirs.dir(AppDirs.BACKUPS);
+    AppDirs.ensureDir(path);
+    return path;
+  }
+
+  /**
+   * 工程目录（.gpkg 落此）：filesDir/projects，不在「调查宝」树内 —— 该位置是历史落盘口径，
+   * 已有工程数据在此，改变它等于丢数据，故只作路径出口（设置页「存储」显示），不做迁移。
+   */
+  static projectsDir(): string {
+    if (AppDirs.filesRoot.length === 0) {
+      return '';
+    }
+    return AppDirs.ensureDir(`${AppDirs.filesRoot}/projects`);
   }
 
   static configFile(name: string): string {

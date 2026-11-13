@@ -7,7 +7,10 @@
 
 import { common } from '@kit.AbilityKit';
 import { relationalStore } from '@kit.ArkData';
+import { AppLog } from '../common/AppLog';
 import { DbKit } from './DbKit';
+
+const TAG: string = 'MapDataStore';
 
 /** 轨迹记录：基本信息 + 坐标点序列 [lat,lon,alt] */
 export class TrackRecord {
@@ -169,7 +172,11 @@ export class MapDataStore {
 
   // ── 轨迹 ────────────────────────────────────────────────────────
 
-  /** 保存一条轨迹及其坐标点，返回轨迹主键（失败 -1） */
+  /**
+   * 保存一条轨迹及其坐标点，返回轨迹主键（失败 -1）。
+   * 事务 + batchInsert：轨迹主体与全部坐标点要么全部落库要么整体回滚，
+   * 避免中途失败留下无点轨迹/残缺点数据（原逐条 insert 无事务）。
+   */
   async addTrack(name: string, createdTime: number, points: number[][],
     color: number = TrackRecord.DEFAULT_COLOR,
     lineWidth: number = TrackRecord.DEFAULT_LINE_WIDTH): Promise<number> {
@@ -177,21 +184,49 @@ export class MapDataStore {
     if (store === null) {
       return -1;
     }
-    const trackId: number = await DbKit.insert(store, 'track', {
-      'name': name, 'created_time': createdTime, 'visible': 1, 'recording': 0,
-      'color': color, 'line_width': lineWidth,
-    });
-    if (trackId < 0) {
+    let trackId: number = -1;
+    try {
+      store.beginTransaction();
+      trackId = await DbKit.insert(store, 'track', {
+        'name': name, 'created_time': createdTime, 'visible': 1, 'recording': 0,
+        'color': color, 'line_width': lineWidth,
+      });
+      if (trackId < 0) {
+        store.rollBack();
+        return -1;
+      }
+      if (points.length > 0) {
+        const buckets: Array<relationalStore.ValuesBucket> = [];
+        for (let i = 0; i < points.length; i++) {
+          const p: number[] = points[i];
+          buckets.push({
+            'track_id': trackId, 'seq': i,
+            'latitude': p[0], 'longitude': p[1], 'altitude': p.length > 2 ? p[2] : 0,
+          });
+        }
+        const inserted: number = await store.batchInsert('track_point', buckets);
+        if (inserted !== points.length) {
+          AppLog.e(`${TAG} addTrack: 轨迹点批量入库不完整 ${inserted}/${points.length}，回滚`);
+          store.rollBack();
+          return -1;
+        }
+      }
+      store.commit();
+    } catch (e) {
+      AppLog.e(`${TAG} addTrack 失败，回滚事务`, e);
+      MapDataStore.safeRollBack(store);
       return -1;
     }
-    for (let i = 0; i < points.length; i++) {
-      const p: number[] = points[i];
-      await DbKit.insert(store, 'track_point', {
-        'track_id': trackId, 'seq': i,
-        'latitude': p[0], 'longitude': p[1], 'altitude': p.length > 2 ? p[2] : 0,
-      });
-    }
     return trackId;
+  }
+
+  /** 回滚兜底：事务外回滚会抛异常，统一吞掉只记日志（与 SampleSurveyStore 口径一致） */
+  private static safeRollBack(store: relationalStore.RdbStore): void {
+    try {
+      store.rollBack();
+    } catch (e) {
+      AppLog.w(`${TAG} 回滚异常: ${e}`);
+    }
   }
 
   /** 加载全部已结束的历史轨迹（含坐标点），按创建时间降序；记录中的草稿轨迹不作为历史返回 */
@@ -336,14 +371,21 @@ export class MapDataStore {
     return record;
   }
 
-  /** 删除轨迹及其坐标点 */
+  /** 删除轨迹及其坐标点（事务包裹：点与主记录要么全删要么都不删，避免留下孤儿点） */
   async deleteTrack(trackId: number): Promise<void> {
     const store: relationalStore.RdbStore | null = this.need();
     if (store === null) {
       return;
     }
-    await DbKit.remove(store, 'track_point', 'track_id = ?', [trackId]);
-    await DbKit.remove(store, 'track', 'id = ?', [trackId]);
+    try {
+      store.beginTransaction();
+      await DbKit.remove(store, 'track_point', 'track_id = ?', [trackId]);
+      await DbKit.remove(store, 'track', 'id = ?', [trackId]);
+      store.commit();
+    } catch (e) {
+      AppLog.e(`${TAG} deleteTrack 失败，回滚事务`, e);
+      MapDataStore.safeRollBack(store);
+    }
   }
 
   async updateTrackName(trackId: number, name: string): Promise<void> {

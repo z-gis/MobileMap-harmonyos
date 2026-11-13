@@ -1,0 +1,13 @@
+{
+  "name": "entry_pc",
+  "version": "1.0.0",
+  "description": "调查宝桌面端（鸿蒙 PC / 2in1）主模块：GIS 式工作台外壳",
+  "main": "",
+  "author": "zys",
+  "license": "Apache-2.0",
+  "dependencies": {
+    // 与 entry（手机端）同一份 globecore HAR；相对路径以本文件所在目录（entry_pc/）为基准，
+    // 与 entry/oh-package.json5 深度一致，切换 registry / file: 时两边要同步改。
+    "@zys/globecore": "file:../../GlobeCore/globecore-harmonyos/library/build/default/outputs/default/@zys-globecore-0.1.5.har",
+  }
+}

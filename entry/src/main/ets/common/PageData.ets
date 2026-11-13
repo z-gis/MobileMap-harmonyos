@@ -45,6 +45,8 @@ export class PageKeys {
   static readonly IMPORTED_LAYER_PATH: string = 'importedLayerPath';
   /** 工程已切换（工程管理页打开/新建写入，主界面消费后刷新数据）：值为新工程名 */
   static readonly PROJECT_CHANGED: string = 'projectChanged';
+  /** 外部打开的文件 URI（文件管理等经 viewData 拉起）：Ability 写入，主地图页装配后消费 */
+  static readonly EXTERNAL_OPEN_URI: string = 'externalOpenUri';
 }
 
 /**

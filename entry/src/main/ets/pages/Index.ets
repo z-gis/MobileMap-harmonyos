@@ -12,23 +12,28 @@
 //  · 启动遮罩门控同 Android：矢量加载完成且最少展示 3s 才淡出，另加最长兜底时长防卡死。
 
 import { common } from '@kit.AbilityKit';
+import { pasteboard } from '@kit.BasicServicesKit';
 import { display, router } from '@kit.ArkUI';
 import { Camera, NativeMapView, VectorExtent, ViewMode } from '@zys/globecore';
 import { LocationDetailDialog } from '../components/LocationDetailDialog';
-import { MeasureDetailDialog } from '../components/MeasureDetailDialog';
+import { DetailTitleHandle, MeasureDetailDialog } from '../components/MeasureDetailDialog';
 import { MediaEditDialog } from '../components/MediaEditDialog';
+import { PhotoSheetDialog } from '../components/PhotoSheetDialog';
+import { PieMenuAction, PieMenuLayer, PieMenuSpec } from '../components/PieMenuLayer';
 import { MoveToDialog } from '../components/MoveToDialog';
+import { NameEditDialog } from '../components/NameEditDialog';
 import { AppConfig } from '../common/AppConfig';
 import { AppLog } from '../common/AppLog';
 import { PageData, PageKeys, PageSignals } from '../common/PageData';
 import { PermissionUtil } from '../common/PermissionUtil';
 import { Theme } from '../common/Theme';
 import { Ui } from '../common/Ui';
-import { MapDocument } from '../doc/DocModels';
+import { LayerInfo, MapDocument } from '../doc/DocModels';
 import { DocumentListener, DocumentManager } from '../doc/DocumentManager';
 import { BackgroundLocationController } from '../location/BackgroundLocationController';
 import { LocationManager, LocationPoint } from '../location/LocationManager';
 import { MediaCaptureHelper } from '../media/MediaCaptureHelper';
+import { MediaPackage } from '../media/MediaPackage';
 import { BusinessOverlayManager } from '../map/BusinessOverlayManager';
 import { CameraNavigator, DEFAULT_LAT, DEFAULT_LON } from '../map/CameraNavigator';
 import { FeatureDetailRequest, FeaturePickController, PickRouter } from '../map/FeaturePickController';
@@ -43,7 +48,9 @@ import { ProjectManager } from '../project/ProjectManager';
 import { MeasureRecord, MediaGroupRecord, PhotoRecord, SurveyPlot, TrackRecord } from '../project/ProjectModels';
 import { TrackSharePackage } from '../track/TrackSharePackage';
 import { FeatureIcons } from '../vector/FeatureIcons';
-import { LayerManageParams, PhotoViewerParams, SurveyEditParams } from './RouteParams';
+import { ImportResult, VectorFileImporter } from '../vector/VectorFileImporter';
+import { AndroidIcons, IconBitmap } from '../vector/AndroidIcons';
+import { LayerManageParams, SurveyEditParams } from './RouteParams';
 
 const TAG: string = 'Index';
 
@@ -52,9 +59,9 @@ const ICON_SIZE: number = 32;
 /** 图标按钮底色（Android colors main_icon_bg=#a0dddddd） */
 const ICON_BG: string = '#A0DDDDDD';
 /**
- * 图标按钮文字色（深灰，全栏统一，含「北」「GO」）。
- * Android 的 jni_map_compass / jni_map_go 是 textColor=@color/white，但那两枚在 Android 上
- * 与一排深色图形图标（nav_*.png）同放于 #a0dddddd 浅底，白字只是点缀；本端 HUD 全部以文字
+ * 图标按钮文字色（深灰，全栏统一，含「北」）。
+ * Android 早期还有 jni_map_go（白字 textColor=@color/white），该键已删、「移动到」改挂中心坐标文本；
+ * 那两枚在 Android 上本就与一排深色图形图标（nav_*.png）同放于 #a0dddddd 浅底，白字只是点缀；本端 HUD 全部以文字
  * 标签代替图标，白字落在同一浅底上几乎看不清，故不照搬，统一用深色。
  */
 const ICON_TEXT: string = '#FF20241F';
@@ -85,8 +92,6 @@ const STARTUP_LOAD_POLL_MS: number = 200;
 /** 遮罩最长兜底（毫秒）：装配异常时也不允许永久遮挡 */
 const STARTUP_MAX_MS: number = 20000;
 const SPLASH_TEXT: string = '正在加载地图资源...';
-/** 定位标记罗盘图标显示尺寸（dp）：本端图标由 FeatureIcons 程序化生成，纹理固定 64px */
-const MARKER_ICON_DP: number = 24;
 
 /**
  * 主地图页。
@@ -115,6 +120,13 @@ struct Index {
   @StorageProp('bottomInsetVp') bottomInset: number = 0;
   /** 横屏标志：可视高度不足，底部按钮群由竖排改横排，保证任何屏幕比例下按钮互不重叠（根 Stack onAreaChange 维护） */
   @State hudLandscape: boolean = false;
+  /**
+   * 长按落点圆菜单：内容与开关。
+   * 拆成两个字段而不是 `PieMenuSpec | undefined`——build() 里对可空字段的类型窄化不可靠，
+   * 浮层构造参数拿到 undefined 会直接编译报错。
+   */
+  @State pieMenu: PieMenuSpec = new PieMenuSpec();
+  @State pieMenuOpen: boolean = false;
 
   // ── 地图控制器（onReady 后就位）──
   private appCtx: common.UIAbilityContext | undefined = undefined;
@@ -133,6 +145,15 @@ struct Index {
   private measureDialog: CustomDialogController | undefined = undefined;
   private moveDialog: CustomDialogController | undefined = undefined;
   private mediaDialog: CustomDialogController | undefined = undefined;
+  /** 拍照点位详情弹层（点地图拍照标识先弹此层，对应 Android PhotoSheetDialog） */
+  private photoSheet: CustomDialogController | undefined = undefined;
+  /** 改名输入框（详情弹层标题栏「重命名」用，叠在详情弹层之上） */
+  private nameDialog: CustomDialogController | undefined = undefined;
+  /** 详情弹层标题就地刷新句柄：改名落库后 setTitle，不重建弹层（用户已改的色/线宽不丢）。
+   *  每次开弹层换一个实例，弹层各自持有自己的挂钩，旧弹层销毁时的解绑不会误伤新弹层 */
+  private detailTitle: DetailTitleHandle = new DetailTitleHandle();
+  /** 拍照点位弹层标题就地刷新句柄（改名落库后 setTitle，同 detailTitle 口径） */
+  private photoTitle: DetailTitleHandle = new DetailTitleHandle();
   /** 定位详情对话框（点底部定位文本弹出，对应 Android LocationDetailDialog.show） */
   private locDialog: CustomDialogController | undefined = undefined;
   /** 拍照点位编辑对话框的分组下拉数据（打开前取当前工程） */
@@ -189,6 +210,11 @@ struct Index {
   }
 
   onBackPress(): boolean {
+    // 圆菜单开着：返回键只收菜单，不动应用
+    if (this.pieMenuOpen) {
+      this.pieMenuOpen = false;
+      return true;
+    }
     this.confirmExit();
     return true;
   }
@@ -217,6 +243,7 @@ struct Index {
     if (listener !== undefined) {
       DocumentManager.getInstance().unregisterListener(listener);
     }
+    PageSignals.unbind(PageKeys.EXTERNAL_OPEN_URI);
     if (this.view !== undefined) {
       this.view.setOnTapListener(undefined);
     }
@@ -230,6 +257,8 @@ struct Index {
     this.sql = undefined;
     this.pick = undefined;
     this.capture = undefined;
+    // 落点圆菜单是瞬态浮层：装配收尾一并收掉，别让它带着旧坐标活到下一轮
+    this.pieMenuOpen = false;
     MapServices.instance.clear();
   }
 
@@ -318,8 +347,8 @@ struct Index {
     location.onFollowChanged = (enabled: boolean): void => {
       this.following = enabled;
     };
-    location.onTrackLocation = (lat: number, lon: number, alt: number): void => {
-      track.onLocation(lat, lon, alt);
+    location.onTrackLocation = (point: LocationPoint): void => {
+      track.onLocation(point);
     };
     capture.onMediaChanged = (): void => {
       overlays.rebuild();
@@ -340,9 +369,25 @@ struct Index {
     });
     AppLog.i(`${TAG} 单击回调已注册（拾取/测量共用）`);
 
-    // 定位标记图标：本端无 drawable，程序化生成三角（指向运动方位）作 billboard 纹理
-    view.setLocationMarkerIcon(FeatureIcons.pixels(FeatureIcons.TRIANGLE, 0xFF3DA5FF),
-      MARKER_ICON_DP, MARKER_ICON_DP);
+    // 长按回调与单击同口径注册（同一 native 事件源、同一像素坐标），空白落点开圆菜单（含兴趣点拍照）。
+    // 长按触发后抬手那次补发单击由 FeaturePickController 按「圆菜单是否还浮着」吞掉（判据在 bindPickRouter 下发），此处无需再处理。
+    view.setOnLongPressListener((x: number, y: number): void => {
+      // 单位自检同单击：长按回传须与视口 px 同量级，若只到 vp 宽则落点经纬度会整体偏 1/密度
+      AppLog.d(`长按回传 (${x.toFixed(1)},${y.toFixed(1)}) 视口px ${(this.vpWidth * this.density).toFixed(0)}x${(this.vpHeight * this.density).toFixed(0)} density=${this.density.toFixed(2)}`);
+      pick.onMapLongPress(x, y);
+    });
+    AppLog.i(`${TAG} 长按回调已注册（空白落点=圆菜单）`);
+
+    // 定位标记图标：对齐 Android MainActivity 的 ic_compass（rawfile 同图解码，带外圈指北环），
+    // 宽高必须传解码后的真实像素尺寸（桥接层按 argb.length===w*h 校验，不符即丢纹理回退蓝点）。
+    // 解码失败才退回程序化三角，同样按纹理真实分辨率 64×64 传尺寸。
+    const markerIcon: IconBitmap | undefined = AndroidIcons.of(this.appCtx, AndroidIcons.COMPASS);
+    if (markerIcon !== undefined) {
+      view.setLocationMarkerIcon(markerIcon.argb, markerIcon.w, markerIcon.h);
+    } else {
+      view.setLocationMarkerIcon(FeatureIcons.pixels(FeatureIcons.TRIANGLE, 0xFF3DA5FF),
+        FeatureIcons.SIZE, FeatureIcons.SIZE);
+    }
     if (this.vpWidth > 0) {
       // 视口以 px 下发：screenToGeo/pickVector 走的是引擎视口（surface px）坐标系，传 vp 会整体偏 1/密度
       navigator.setViewportSize(this.vpWidth * this.density, this.vpHeight * this.density);
@@ -438,6 +483,12 @@ struct Index {
 
     AppLog.i(`${TAG} 地图装配完成 合计=${Date.now() - t0}ms`);
     this.beginSplashGate();
+    // 外部打开：冷启动时 URI 已在交接槽里（EntryAbility.onCreate 早于本页装配），此处消费；
+    // 再绑定信号承接运行中的 onNewWant（singleton 复用实例，不会再走 onCreate）
+    PageSignals.bind(PageKeys.EXTERNAL_OPEN_URI, (): void => {
+      this.consumeExternalOpen();
+    });
+    this.consumeExternalOpen();
   }
 
   /** 装配失败兜底：解除遮罩并提示（不抛出，避免页面停在空白遮罩） */
@@ -451,7 +502,8 @@ struct Index {
   /**
    * 拾取分流（对应 Android MainActivity 实现的 PickHitRouter）：
    * 测量/轨迹命中复用同一个样式对话框；点位命中直接进照片浏览；样地命中进录入页；
-   * 文件要素命中走详情页（对象经 PageData 交接，属性异步回取后经 PageSignals 通知回填）。
+   * 文件要素命中走详情页（对象经 PageData 交接，属性异步回取后经 PageSignals 通知回填）；
+   * 长按空白落点开圆菜单（capture/navigator 由本页面字段取，不作参数传）。
    */
   private bindPickRouter(pickRouter: PickRouter, ctx: common.UIAbilityContext): void {
     pickRouter.onMeasureHit = (recordId: number): void => {
@@ -468,10 +520,8 @@ struct Index {
       }
     };
     pickRouter.onMediaHit = (placemark: PhotoRecord): void => {
-      const params: PhotoViewerParams = new PhotoViewerParams();
-      params.placemarkId = placemark.id;
-      params.initialIndex = 0;
-      router.pushUrl({ url: 'pages/PhotoViewerPage', params: params });
+      // 与 Android 一致：点拍照标识先弹详情层（重命名/备注/分享/删除 + 照片网格），不再直进浏览页
+      this.openPhotoSheet(placemark, ctx);
     };
     pickRouter.onSurveyHit = (plotId: number): void => {
       const plot: SurveyPlot | null = ProjectManager.get(ctx).findSurveyPlot(plotId);
@@ -496,12 +546,123 @@ struct Index {
       AppLog.d(`要素属性已回取: ${req.path}#${req.fid}`);
       PageSignals.fire(PageKeys.FEATURE_DETAIL);
     };
+    pickRouter.onDropPoint = (lat: number, lon: number, xPx: number, yPx: number,
+      hasFeature: boolean): void => {
+      this.showMapPieMenu(lat, lon, xPx, yPx, hasFeature);
+    };
+    // 长按抬手补发的那次单击归 native（浮层遮罩拦不住已在进行的手势），判据交回本页的菜单开关：
+    // 菜单还浮着 = 地图不该响应这次单击，按住多久都吞得掉（旧的时间窗在慢放开时会漏）。
+    pickRouter.isPieMenuOpen = (): boolean => this.pieMenuOpen;
+  }
+
+  /**
+   * 长按圆菜单（对应 Android MainActivity.showMapPieMenu，并把它那份 showFeatureEditMenu 合成一项）：
+   * 以落点为锚弹快捷动作，图标在上、文案在下（见 PieMenuLayer）；命中要素时首位多挂一项「编辑」，
+   * 它按同一落点重跑单击的分流（文件要素→详情/属性页，测量/轨迹/拍照点位/样地→各自详情层），
+   * 于是一份菜单同时管「落点」和「要素」两种语义。
+   * 锚点口径：native 回传 px（与 screenToGeo 同一引擎口径），浮层是 ArkUI 布局要 vp，故 ÷densityPixels。
+   * 兴趣点仍守「确认后才建点」：点位记录在点「添加兴趣点」之后才落库，取消/收起不留空点。
+   */
+  private showMapPieMenu(lat: number, lon: number, xPx: number, yPx: number, hasFeature: boolean): void {
+    const density: number = this.density > 0 ? this.density : 1;
+    // 经度在前、6 位小数，与定位详情弹层的复制口径一致
+    const coordText: string = `${Ui.fixed(lon)},${Ui.fixed(lat)}`;
+    const capture: MediaCaptureHelper | undefined = this.capture;
+    const navigator: CameraNavigator | undefined = this.navigator;
+    const pick: FeaturePickController | undefined = this.pick;
+    const actions: PieMenuAction[] = [];
+    if (hasFeature) {
+      actions.push(new PieMenuAction($rawfile('ic_pie_edit.svg'), '编辑', (): void => {
+        if (pick === undefined) {
+          AppLog.w('[PieMenu] 编辑：拾取控制器未就绪');
+          return;
+        }
+        pick.editHitAt(xPx, yPx);
+      }));
+    }
+    // 居中到此处：相机平移到落点，保留当前缩放级别
+    actions.push(new PieMenuAction($rawfile('ic_pie_center.svg'), '居中到此处', (): void => {
+      if (navigator === undefined) {
+        AppLog.w('[PieMenu] 居中到此处：相机导航器未就绪');
+        return;
+      }
+      navigator.moveToLocation(lat, lon);
+    }));
+    // 复制坐标：落点经纬度写系统剪贴板
+    actions.push(new PieMenuAction($rawfile('ic_pie_copy.svg'), '复制坐标', (): void => {
+      this.copyToClipboard(coordText);
+    }));
+    // 添加兴趣点：以落点坐标建点位，图片来源二选一（相机连拍 / 相册选图），都不依赖定位
+    actions.push(new PieMenuAction($rawfile('ic_pie_poi.svg'), '添加兴趣点', (): void => {
+      if (capture === undefined) {
+        AppLog.w('[PieMenu] 添加兴趣点：拍照助手未就绪');
+        return;
+      }
+      Ui.items('兴趣点图片来源', ['拍照', '从相册选图']).then((which: number): void => {
+        // 弹窗被取消（-1）时什么都不做：点位还没建，天然不留空点
+        let run: Promise<void> = Promise.resolve();
+        if (which === 0) {
+          run = capture.startSessionAt(lat, lon, '兴趣点');
+        } else if (which === 1) {
+          run = capture.addPhotosFromAlbum(lat, lon, '兴趣点');
+        }
+        run.then((): void => {}, (e: Error): void => {
+          AppLog.e('落点兴趣点写入失败', e);
+        });
+      }, (e: Error): void => {
+        AppLog.e('兴趣点图片来源弹窗失败', e);
+      });
+    }));
+    // 位置信息：直接报出落点坐标
+    actions.push(new PieMenuAction($rawfile('ic_pie_info.svg'), '位置信息', (): void => {
+      Ui.toast(`落点坐标 ${coordText}`);
+    }));
+
+    const spec: PieMenuSpec = new PieMenuSpec();
+    spec.anchorXVp = xPx / density;
+    spec.anchorYVp = yPx / density;
+    spec.actions = actions;
+    this.openPieMenu(spec);
+  }
+
+  /**
+   * 弹出圆菜单。浮层的内容参数只在组件创建时赋值一次（普通成员，@Prop 深拷贝又会把 run 函数丢掉），
+   * 故菜单还开着又要换锚点时先收掉、下一帧再弹——原地改 this.pieMenu 会得到一份停在旧坐标的菜单。
+   */
+  private openPieMenu(spec: PieMenuSpec): void {
+    if (this.pieMenuOpen) {
+      this.pieMenuOpen = false;
+      setTimeout((): void => {
+        this.pieMenu = spec;
+        this.pieMenuOpen = true;
+      }, 0);
+      return;
+    }
+    this.pieMenu = spec;
+    this.pieMenuOpen = true;
+  }
+
+  /** 写系统剪贴板（口径同定位详情弹层的「复制」：成功/失败都给 Toast，异常只记日志不抛） */
+  private copyToClipboard(text: string): void {
+    try {
+      const data: pasteboard.PasteData = pasteboard.createData(pasteboard.MIMETYPE_TEXT_PLAIN, text);
+      pasteboard.getSystemPasteboard().setData(data).then((): void => {
+        Ui.toast('坐标已复制');
+      }, (e: Error): void => {
+        AppLog.e('写剪贴板失败', `${e}`);
+        Ui.toast('复制失败');
+      });
+    } catch (e) {
+      AppLog.e('写剪贴板失败', `${e}`);
+      Ui.toast('复制失败');
+    }
   }
 
   // ── 弹层：测量 / 轨迹 / 拍照点位 / 移动到 ──────────────────────────
 
   /** 测量详情（Android MeasureCaptureController.showMeasureDetail 等价） */
   private openMeasureDetail(record: MeasureRecord, ctx: common.UIAbilityContext): void {
+    this.detailTitle = new DetailTitleHandle();
     this.measureDialog = new CustomDialogController({
       builder: MeasureDetailDialog({
         title: record.name,
@@ -510,6 +671,8 @@ struct Index {
         widthEditable: record.type !== MeasureRecord.TYPE_POINT,
         initialColor: ProjectManager.parseColor(record.color, Index.defaultColorForMeasureType(record.type)),
         initialLineWidth: record.lineWidth,
+        initialRemark: record.remark,
+        titleHandle: this.detailTitle,
         onSave: (color: number, lineWidth: number): void => {
           ProjectManager.get(ctx).updateMeasureStyle(record.id, color, lineWidth).then((): void => {
             this.rebuildOverlays();
@@ -521,6 +684,12 @@ struct Index {
         onDelete: (): void => {
           this.confirmDeleteMeasurement(record, ctx);
         },
+        onRename: (): void => {
+          this.promptRenameDetail(record.id, false, record.name, ctx);
+        },
+        onRemark: (remark: string): void => {
+          this.saveMeasureRemark(record, remark, ctx);
+        },
       }),
       customStyle: true,
       alignment: DialogAlignment.Center,
@@ -531,6 +700,7 @@ struct Index {
 
   /** 轨迹详情（Android TrackCaptureController.showTrackDetail 复用同一对话框） */
   private openTrackDetail(record: TrackRecord, ctx: common.UIAbilityContext): void {
+    this.detailTitle = new DetailTitleHandle();
     this.measureDialog = new CustomDialogController({
       builder: MeasureDetailDialog({
         title: record.name,
@@ -539,6 +709,7 @@ struct Index {
         widthEditable: true,
         initialColor: ProjectManager.parseColor(record.color, 0xFF33CCFF),
         initialLineWidth: record.lineWidth,
+        titleHandle: this.detailTitle,
         onSave: (color: number, lineWidth: number): void => {
           ProjectManager.get(ctx).updateTrackStyle(record.id, color, lineWidth).then((): void => {
             this.rebuildOverlays();
@@ -549,6 +720,9 @@ struct Index {
         },
         onDelete: (): void => {
           this.confirmDeleteTrack(record, ctx);
+        },
+        onRename: (): void => {
+          this.promptRenameDetail(record.id, true, record.name, ctx);
         },
         // 分享按导出 shp 数据包（折线 + WGS84，见 track/TrackSharePackage）经系统分享面板发出
         onShare: (): void => {
@@ -571,6 +745,40 @@ struct Index {
       return MapStyle.MEASURE_COLOR_POINT;
     }
     return MapStyle.MEASURE_COLOR_DISTANCE;
+  }
+
+  /**
+   * 详情弹层「编辑」→ 改名（Android promptRenameMeasure / promptRenameTrack 等价）：
+   * 名称写库 → 重建叠加层刷新标注 → 经当前弹层的 titleHandle 就地刷新标题 → 轻提示。
+   * 弹层保持打开（改名框叠在其上），故用户未保存的颜色/线宽不丢。
+   * @param isTrack true=轨迹，false=测量
+   */
+  private promptRenameDetail(recordId: number, isTrack: boolean, currentName: string,
+    ctx: common.UIAbilityContext): void {
+    this.nameDialog = new CustomDialogController({
+      builder: NameEditDialog({
+        title: isTrack ? '重命名轨迹' : '重命名测量',
+        label: isTrack ? '轨迹名称' : '测量名称',
+        placeholder: '请输入名称',
+        initialValue: currentName,
+        onConfirmName: (name: string): void => {
+          const pm: ProjectManager = ProjectManager.get(ctx);
+          const task: Promise<void | boolean> =
+            isTrack ? pm.updateTrackName(recordId, name) : pm.updateMeasureName(recordId, name);
+          Promise.resolve(task).then((): void => {
+            this.rebuildOverlays();
+            this.detailTitle.setTitle(name);
+            Ui.toast('已重命名');
+          }, (e: Error): void => {
+            AppLog.e(isTrack ? '轨迹改名失败' : '测量改名失败', `${e}`);
+          });
+        },
+      }),
+      customStyle: true,
+      alignment: DialogAlignment.Center,
+      autoCancel: true,
+    });
+    this.nameDialog.open();
   }
 
   private confirmDeleteMeasurement(record: MeasureRecord, ctx: common.UIAbilityContext): void {
@@ -625,6 +833,8 @@ struct Index {
     groupId: number, newGroupName: string): void {
     this.saveMediaEdit(ctx, placemarkId, name, groupId, newGroupName).then((): void => {
       this.rebuildOverlays();
+      // 拍照详情弹层若开着，就地刷新标题（句柄未绑定即落空，拍照会话流程不受影响）
+      this.photoTitle.setTitle(name);
     }, (e: Error): void => {
       AppLog.e('保存拍照点位失败', `${e}`);
     });
@@ -645,6 +855,77 @@ struct Index {
     await pm.updatePhotoName(placemarkId, name);
     await pm.updatePhotoGroup(placemarkId, target);
     Ui.toast('已保存');
+  }
+
+  /** 拍照点位详情弹层（Android PhotoSheetDialog 等价）：重命名/备注/分享/删除 + 照片网格 */
+  private openPhotoSheet(placemark: PhotoRecord, ctx: common.UIAbilityContext): void {
+    this.photoTitle = new DetailTitleHandle();
+    const pm: ProjectManager = ProjectManager.get(ctx);
+    this.photoSheet = new CustomDialogController({
+      builder: PhotoSheetDialog({
+        placemark: placemark,
+        gpkgPath: pm.currentProjectPath,
+        cacheDir: ctx.cacheDir,
+        titleHandle: this.photoTitle,
+        onRename: (): void => {
+          this.openMediaEdit(placemark, ctx);
+        },
+        onRemark: (remark: string): void => {
+          this.savePhotoRemark(placemark, remark, ctx);
+        },
+        onShare: (): void => {
+          MediaPackage.sharePlacemark(ctx, placemark);
+        },
+        onDelete: (): void => {
+          this.confirmDeletePlacemark(placemark, ctx);
+        },
+      }),
+      customStyle: true,
+      alignment: DialogAlignment.Center,
+      autoCancel: true,
+    });
+    this.photoSheet.open();
+  }
+
+  /** 拍照点位备注落库（编辑框已挪进 PhotoSheetDialog 底部行，本层只写库）：备注不上图，重建叠加层刷新标注 */
+  private savePhotoRemark(placemark: PhotoRecord, remark: string, ctx: common.UIAbilityContext): void {
+    // updatePhotoRemark 内部已把新备注写回内存记录，此处不再赋值
+    ProjectManager.get(ctx).updatePhotoRemark(placemark.id, remark).then((): void => {
+      this.rebuildOverlays();
+      Ui.toast('备注已保存');
+    }, (e: Error): void => {
+      AppLog.e('保存照片备注失败', `${e}`);
+    });
+  }
+
+  /** 测量备注写库（编辑框已挪进 MeasureDetailDialog 底部行，本层只写库）：落库后重建叠加层 */
+  private saveMeasureRemark(record: MeasureRecord, remark: string, ctx: common.UIAbilityContext): void {
+    ProjectManager.get(ctx).updateMeasureRemark(record.id, remark).then((ok: boolean): void => {
+      if (!ok) {
+        AppLog.e('保存测量备注失败', `id=${record.id}`);
+        return;
+      }
+      this.rebuildOverlays();
+      Ui.toast('备注已保存');
+    }, (e: Error): void => {
+      AppLog.e('保存测量备注失败', `${e}`);
+    });
+  }
+
+  /** 删除拍照点位确认（Android PhotoSheetDialog.confirmDeletePlacemark 等价）：点位及全部照片一并删除 */
+  private confirmDeletePlacemark(placemark: PhotoRecord, ctx: common.UIAbilityContext): void {
+    Ui.confirm('删除确认', `确定删除拍照点位：${placemark.name} ？删除后该点位及全部照片将一并删除。`,
+      '删除').then((ok: boolean): void => {
+        if (!ok) {
+          return;
+        }
+        ProjectManager.get(ctx).removePhoto(placemark.id).then((): void => {
+          this.rebuildOverlays();
+          Ui.toast('已删除');
+        }, (e: Error): void => {
+          AppLog.e('删除拍照点位失败', `${e}`);
+        });
+      });
   }
 
   /** 「移动到」：初值优先定位 > 相机中心 > 兜底默认；确认后平移（保留缩放级别） */
@@ -753,6 +1034,61 @@ struct Index {
     }
   }
 
+  /**
+   * 外部打开承接（对应 Android ExternalImportHandler.handleViewIntent）：
+   * 文件管理等经 viewData 拉起的 URI 与选择器返回的同形（file://docs/... 临时授权），
+   * 故直接复用矢量导入器——拷入沙箱 → zip/kmz 解压 → 写文档去重落盘 → 缩放到首个图层；
+   * 落盘广播经文档监听器同步矢量层，此处不手动上图。
+   */
+  private async consumeExternalOpen(): Promise<void> {
+    const raw: Object | undefined = PageData.take(PageKeys.EXTERNAL_OPEN_URI);
+    if (raw === undefined) {
+      return;
+    }
+    const uri: string = raw as string;
+    const nav: CameraNavigator | undefined = this.navigator;
+    const doc: MapDocument | null = DocumentManager.getInstance().getDocument();
+    if (nav === undefined || doc === null) {
+      AppLog.w(`${TAG} 外部打开时地图/文档未就绪，忽略 ${uri}`);
+      return;
+    }
+    AppLog.i(`${TAG} 导入外部文件 ${uri}`);
+    const results: ImportResult[] = await VectorFileImporter.importPicked([uri]);
+    if (results.length === 0) {
+      Ui.toastLong('外部文件导入失败（格式不支持或读取失败，详见日志）');
+      return;
+    }
+    let added: number = 0;
+    let firstPath: string = '';
+    for (let i = 0; i < results.length; i++) {
+      const r: ImportResult = results[i];
+      let exists: boolean = false;
+      for (let j = 0; j < doc.vectorLayers.length; j++) {
+        if (doc.vectorLayers[j].path === r.path) {
+          exists = true;
+          break;
+        }
+      }
+      if (exists) {
+        continue;
+      }
+      doc.vectorLayers.push(new LayerInfo(r.name, r.path, LayerInfo.TYPE_VECTOR, true));
+      added++;
+      if (firstPath.length === 0) {
+        firstPath = r.path;
+      }
+    }
+    if (added === 0) {
+      // 重复打开同一文件：图层已在图内，只缩放过去（与选择器导入的去重口径一致）
+      nav.zoomToLayerExtent(results[0].path);
+      Ui.toast('该图层已在当前工程内');
+      return;
+    }
+    DocumentManager.getInstance().save();
+    nav.zoomToLayerExtent(firstPath);
+    Ui.toast(`已导入 ${added} 个图层`);
+  }
+
   // ── 冷启动遮罩 ───────────────────────────────────────────────────
 
   /** 加载门控：矢量层加载完成且最少展示 3s 才淡出；超时兜底淡出（Android beginStartupLayerLoadGate 等价） */
@@ -822,7 +1158,7 @@ struct Index {
     }
   }
 
-  /** 定位详情：点底部定位坐标文本弹出（「移动到」入口已迁到左下 GO 键） */
+  /** 定位详情：点底部定位坐标文本弹出（对齐 Android locationText → LocationDetailDialog；「移动到」入口挂中心坐标文本） */
   private showLocationDetail(): void {
     this.locDialog = new CustomDialogController({
       builder: LocationDetailDialog({}),
@@ -906,7 +1242,7 @@ struct Index {
       // 会让 Stack 底层的 NativeMapView 一并进入命中（表现为点按键地图也跟着平移、还弹要素详情）；
       // 故栏内可点节点一律走 MapIconButton / chip，它们自带 HitTestMode.Block 吃掉事件。
       Row() {
-        // 左栏：指北 → 测量 → 设置/定位/轨迹/GO（2D/3D 切换键已删，视图模式改由设置页控制）
+        // 左栏：指北 → 测量 → 设置/定位/轨迹（2D/3D 切换键与 GO 键均已删，前者改由设置页控制、后者改挂中心坐标文本）
         Column() {
           Row({ space: 5 }) {
             if (this.compassVisible) {
@@ -1065,7 +1401,8 @@ struct Index {
       // 底部状态栏：定位坐标在前（左）+ 中心坐标在后（右）—— 次序与权重分配对齐 Android
       // activity_main.xml：定位 TextView wrap_content 优先完整显示（含海拔段），中心 TextView
       // 0dp+weight 占剩余宽度并尾部省略，空间不足时只截中心。
-      // 点定位文本弹「定位详情」（对应 Android locationText → LocationDetailDialog），「移动到」入口已改 GO 键。
+      // 点定位文本弹「定位详情」（对应 Android locationText → LocationDetailDialog），
+      // 点中心文本弹「移动到」（对应 Android centerText → showMoveToDialog，原左下 GO 键入口在 Android 已删）。
       // 按需求保持贴住屏幕最底，不做导航条避让（指示条叠在半透明底色上，与 Android 贴底观感一致）
       Column() {
         Row() {
@@ -1085,6 +1422,9 @@ struct Index {
             .textAlign(TextAlign.End)
             .layoutWeight(1)
             .padding({ left: 8 })
+            .onClick((): void => {
+              this.showMoveToDialog();
+            })
         }
         .width('100%')
         .height(STATUS_HEIGHT)
@@ -1095,6 +1435,17 @@ struct Index {
       .width('100%')
       .position({ x: 0, y: '100%' })
       .markAnchor({ x: 0, y: '100%' })
+
+      // 长按圆菜单（对应 Android PieMenu 叠在 content 上）：空白与命中要素都弹，命中时多一项「编辑」
+      // 浮层根节点为默认命中模式（自身+子节点参与、屏蔽兄弟地图），空白收起由浮层内的遮罩节点自理
+      if (this.pieMenuOpen) {
+        PieMenuLayer({
+          spec: this.pieMenu,
+          onDismiss: (): void => {
+            this.pieMenuOpen = false;
+          },
+        })
+      }
 
       // 启动遮罩：盖住 native/proj/文档初始化与首屏瓦片加载，装配完成后淡出
       if (this.splash) {
@@ -1147,7 +1498,7 @@ struct Index {
 
   /** 方形图标按钮已抽为文件末尾的 MapIconButton 组件（理由见该组件注释），此处只剩文本动作胶囊 */
 
-  /** 左下按钮群：设置 / 定位（跟随）/ 轨迹采集（暂停·停止）/ 轨迹 / 移动到 —— 竖屏竖排、横屏横排共用 */
+  /** 左下按钮群：设置 / 定位（跟随）/ 轨迹采集（暂停·停止）/ 轨迹 —— 竖屏竖排、横屏横排共用 */
   @Builder
   hudLeftBottom() {
     MapIconButton({
@@ -1188,18 +1539,16 @@ struct Index {
         },
       })
     }
-    MapIconButton({
-      label: '轨迹',
-      action: (): void => {
-        this.openTrackMenu();
-      },
-    })
-    MapIconButton({
-      label: 'GO',
-      action: (): void => {
-        this.showMoveToDialog();
-      },
-    })
+    // 「轨迹」入口键：记录中隐藏（改由上方暂停/停止键接管），停止/完成记录后随 trackRecording 转 false 复现
+    if (!this.trackRecording) {
+      MapIconButton({
+        label: '轨迹',
+        action: (): void => {
+          this.openTrackMenu();
+        },
+      })
+    }
+    // 「移动到」不再占一枚键：Android 已删 jni_map_go，入口改为中心坐标文本点击（见底部状态栏）
   }
 
   /** 右下按钮群：注记显隐 + 缩放面板（＋ / 级别 / －）—— 竖屏竖排、横屏横排共用 */

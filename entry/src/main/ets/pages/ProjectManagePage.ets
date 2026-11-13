@@ -4,17 +4,26 @@
 // （与 LayerManagePage 同策略：列表行操作密度高，对话框放不下），主界面入口接线在后续批次统一做。
 // 交互对齐 Android 已定规则：
 //  · 列表项：工程名 +（当前工程蓝底标记）+ 修改时间/大小；行点击 = 打开，右侧三点按钮弹操作菜单
-//    （打开/重命名/分享/删除，当前工程项无「删除」），禁止长按交互。
+//    （分享/复制/重命名/备份/合并，非当前工程另有「删除」「合并到当前工程」），禁止长按交互。
+//    菜单不含「打开」——与 Android 一致，打开走行点击。
 //  · 打开/新建成功后经 PageData 交接槽（PageKeys.PROJECT_CHANGED）携结果返回，
-//    主界面消费后刷新数据（与 IMPORTED_LAYER_PATH 同一惯例）。
-//  · 重命名同名冲突由 ProjectManager 拒绝，此处 toast 提示；新建重名自动带序号。
+//    主界面消费后刷新数据（与 IMPORTED_LAYER_PATH 同一惯例）；合并改写了当前工程数据，
+//    同样置该交接槽（页面留在原地，返回主界面即重建叠加层）。
+//  · 重命名同名冲突由 ProjectManager 拒绝，此处 toast 提示；新建重名自动带序号；
+//    复制命名「xx 副本」，已存在则递增序号（uniqueCopyName 同口径）。
 //  · 删除需二次确认；API 层 ProjectManager.deleteProject 亦拒绝删除当前工程（双保险）。
+//  · 合并（startMerge）恒以当前工程为目标：源工程只读不改写；并入前自动备份当前工程，
+//    备份失败即中止（本操作不可撤销地改写当前工程，宁可不做），因此无需「撤销」。
+//    整段流程（读源 → 确认 → 备份 → 并表 → 落盘）由 merging 标记防抖；鸿蒙增量写是同步
+//    NAPI，故各步直接 await，不进线程（Android 的后台线程编排在此无对应物）。
 //
 // 分享导出（鸿蒙沙箱无公共目录写权限，两路径按优先级）：
 //  ① 系统分享面板 @kit.ShareKit systemShare（media/MediaPackage.ets 分享照片包已验证同款可用），
 //     gpkg 单文件自包含，分享文件本体，QGIS/ArcGIS 可直接读取；当前工程先 saveNow() 保证元数据落盘；
 //  ② 分享面板拉起失败时退化为「导出副本」：@kit.CoreFileKit picker DocumentSaveOptions
 //     让用户选公共 Documents 目录位置保存副本。
+// 备份同理落在沙箱 <filesDir>/调查宝/backups/（Android 是 /sdcard/调查宝/backups），
+// 需要取出时用「分享」把备份文件发出去（本版本先保数据，不做备份列表 UI）。
 
 import fs from '@ohos.file.fs';
 import { common } from '@kit.AbilityKit';
@@ -26,9 +35,10 @@ import { AppLog } from '../common/AppLog';
 import { PageData, PageKeys } from '../common/PageData';
 import { Theme } from '../common/Theme';
 import { Ui } from '../common/Ui';
-import { ProjectManager, ProjectInfo } from '../project/ProjectManager';
+import { MergeResult, ProjectManager, ProjectInfo } from '../project/ProjectManager';
 import { Project } from '../project/ProjectModels';
 import { NameEditDialog } from '../components/NameEditDialog';
+import { OptionListDialog } from '../components/OptionListDialog';
 import { TitleBar } from '../components/TitleBar';
 
 /** UDMF 统一数据类型：数据库文件（gpkg 本质 SQLite，分享面板据此匹配接收端） */
@@ -59,8 +69,12 @@ struct ProjectManagePage {
   @State rows: ProjectRow[] = [];
   /** 打开/新建进行中：防双击重复切换（Android isOpening 标记同义） */
   @State opening: boolean = false;
+  /** 合并进行中：整段流程（读源 → 确认 → 备份 → 并表 → 落盘）期间忽略再次点击（Android mergeRunning 同义） */
+  private merging: boolean = false;
 
   private nameDialog: CustomDialogController | undefined = undefined;
+  /** 合并源候选列表对话框：候选每次弹前才确定，故重建控制器 */
+  private optionDialog: CustomDialogController | undefined = undefined;
 
   aboutToAppear(): void {
     this.reload();
@@ -245,22 +259,170 @@ struct ProjectManagePage {
     await this.reload();
   }
 
-  /** 三点按钮操作菜单（对应 Android setItems）：当前工程无「删除」项 */
+  /** 复制工程为新文件：命名「xx 副本」递增去重，成功后刷新列表（当前工程也会先落盘再复制） */
+  private async copyProject(row: ProjectRow): Promise<void> {
+    const newName: string = this.uniqueCopyName(row.baseName);
+    const done: boolean = await this.pm().duplicateProject(row.fileName, newName);
+    if (done) {
+      Ui.toast(`已复制为「${newName}」`);
+      await this.reload();
+    } else {
+      Ui.toast('复制失败');
+    }
+  }
+
+  /** 复制命名：「xx 副本」，已存在则递增序号（同 Android uniqueCopyName） */
+  private uniqueCopyName(base: string): string {
+    const existing: Set<string> = new Set<string>();
+    for (let i = 0; i < this.rows.length; i++) {
+      existing.add(this.rows[i].fileName);
+    }
+    let name: string = `${base} 副本`;
+    let i: number = 2;
+    while (existing.has(`${name}.gpkg`)) {
+      name = `${base} 副本${i}`;
+      i++;
+    }
+    return name;
+  }
+
+  /** 备份工程文件到 backups/（带时间戳，不进工程列表）；当前工程先落盘保证备份为最新 */
+  private async backupProject(row: ProjectRow): Promise<void> {
+    const pm: ProjectManager = this.pm();
+    const dst: string = row.current ? await pm.backupCurrentProject() : await pm.backupProjectFile(row.fileName);
+    Ui.toastLong(dst.length > 0 ? `已备份：${dst}` : '备份失败');
+  }
+
+  // ── 合并（目标恒为当前工程）─────────────────────────────────────
+
+  /** 当前工程行「合并」：列出其余工程供选择作为合并源 */
+  private showMergeSourcePicker(current: ProjectRow): void {
+    const candidates: ProjectRow[] = [];
+    for (let i = 0; i < this.rows.length; i++) {
+      if (!this.rows[i].current) {
+        candidates.push(this.rows[i]);
+      }
+    }
+    if (candidates.length === 0) {
+      Ui.toast('没有其他工程可合并');
+      return;
+    }
+    const names: string[] = [];
+    for (let i = 0; i < candidates.length; i++) {
+      names.push(candidates[i].baseName);
+    }
+    this.optionDialog = new CustomDialogController({
+      builder: OptionListDialog({
+        title: `选择并入「${current.baseName}」的工程`,
+        hint: '选中工程的采集数据将追加到当前工程，源工程保持不变。',
+        options: names,
+        onPick: (index: number): void => {
+          this.startMerge(candidates[index]);
+        },
+      }),
+      customStyle: true,
+      alignment: DialogAlignment.Center,
+      autoCancel: true,
+    });
+    this.optionDialog.open();
+  }
+
+  /**
+   * 合并入口：读源工程（整库读，大工程耗时）→ 弹确认框列出并入条数 → 确认后交 doMerge。
+   * [source] 是作为合并源的工程行，目标恒为当前工程。
+   */
+  private async startMerge(source: ProjectRow): Promise<void> {
+    const pm: ProjectManager = this.pm();
+    if (this.merging) {
+      Ui.toast('正在合并工程，请稍候');
+      return;
+    }
+    if (source.fileName === pm.currentFileName()) {
+      Ui.toast('源工程与当前工程相同，无需合并');
+      return;
+    }
+    if (!AppDirs.exists(source.filePath)) {
+      Ui.toast('源工程文件不存在');
+      await this.reload();
+      return;
+    }
+    if (pm.currentProject === null) {
+      Ui.toast('当前工程不可用，无法合并');
+      return;
+    }
+    const sourceName: string = source.baseName;
+    const targetName: string = ProjectManager.baseNameNoExt(pm.currentFileName());
+    this.merging = true;
+    Ui.toast('正在读取源工程…');
+    const src: Project | null = await pm.readProject(source.filePath);
+    if (src === null) {
+      this.merging = false;
+      Ui.toast('源工程读取失败');
+      return;
+    }
+    const stats: MergeResult = pm.statsOf(src);
+    if (stats.isEmpty) {
+      this.merging = false;
+      Ui.toast(`「${sourceName}」没有可合并的数据`);
+      return;
+    }
+    const agreed: boolean = await Ui.confirm(`合并到「${targetName}」`,
+      `将「${sourceName}」的采集数据并入当前工程：\n${stats.describe()}\n\n`
+        + '源工程保持不变；当前工程先自动备份到 backups/。', '合并');
+    if (!agreed) {
+      this.merging = false;
+      return;
+    }
+    await this.doMerge(pm, src, source.filePath, sourceName);
+  }
+
+  /**
+   * 执行合并：备份当前工程 →（备份成功才继续）并表 + 照片本体搬运 → 元数据落盘 → 刷新列表。
+   * 备份失败即中止——本操作不可撤销地改写当前工程，宁可不做。
+   */
+  private async doMerge(pm: ProjectManager, src: Project, sourcePath: string, sourceName: string): Promise<void> {
+    Ui.toast('正在合并工程…');
+    const backup: string = await pm.backupCurrentProject();
+    if (backup.length === 0) {
+      this.merging = false;
+      Ui.toastLong('备份当前工程失败，已取消合并');
+      return;
+    }
+    const res: MergeResult | null = await pm.mergeIntoCurrent(src, sourcePath);
+    this.merging = false;
+    if (res === null) {
+      Ui.toast('合并中止：当前工程不可用');
+      return;
+    }
+    await pm.saveNow();
+    Ui.toastLong(`已将「${sourceName}」并入：${res.describe()}　·　备份见 调查宝/backups/`);
+    // 当前工程数据已变，交回主界面时重建叠加层（同打开/新建的惯例，页面本身留在原地）
+    PageData.put(PageKeys.PROJECT_CHANGED, pm.currentFileName());
+    await this.reload();
+  }
+
+  /** 三点按钮操作菜单（对应 Android setItems）：当前工程无「删除」，合并项按目标恒为当前工程取词 */
   private showActionMenu(row: ProjectRow): void {
     const options: string[] = row.current
-      ? ['打开', '重命名', '分享']
-      : ['打开', '重命名', '分享', '删除'];
+      ? ['分享', '复制', '重命名', '备份', '合并']
+      : ['分享', '复制', '重命名', '备份', '删除', '合并到当前工程'];
     Ui.items(row.baseName, options).then((idx: number): void => {
       if (idx < 0) {
         return;
       }
       const action: string = options[idx];
-      if (action === '打开') {
-        this.openProject(row);
+      if (action === '分享') {
+        this.shareProject(row);
+      } else if (action === '复制') {
+        this.copyProject(row);
       } else if (action === '重命名') {
         this.showRenameDialog(row);
-      } else if (action === '分享') {
-        this.shareProject(row);
+      } else if (action === '备份') {
+        this.backupProject(row);
+      } else if (action === '合并') {
+        this.showMergeSourcePicker(row);
+      } else if (action === '合并到当前工程') {
+        this.startMerge(row);
       } else if (action === '删除') {
         this.deleteProject(row);
       }
@@ -361,7 +523,7 @@ struct ProjectManagePage {
         this.openProject(row);
       })
 
-      // 右侧三点按钮：弹操作菜单（打开/重命名/分享/删除），禁止长按交互
+      // 右侧三点按钮：弹操作菜单（分享/复制/重命名/备份/合并，非当前工程另有删除），禁止长按交互
       Text('⋮')
         .fontSize(22)
         .fontColor(Theme.TEXT_SUB)

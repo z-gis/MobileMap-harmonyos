@@ -1,12 +1,12 @@
 // AddLayerPage.ets —— 导入本地图层页（对应 Android ui.activity.OpenFileActivity）。
 //
-// Android 自研了一套文件管理器（沙箱外真直连路径，可原地引用）；鸿蒙沙箱不允许应用遍历公共目录，
-// 标准做法是调起系统文件选择器（DocumentViewPicker）拿授权 URI，再由 VectorFileImporter 拷入沙箱
-// 调查宝/layer/ 后引用。因此本页不承担「浏览目录」，只承担 Android OpenFileActivity 的其余职责：
-//  · 按类型限定可选扩展名（矢量白名单 / 栅格白名单，与 Android EXTRA_FILE_TYPES 同集）；
-//  · 支持一次多选（shp 需连同 .dbf/.shx/.prj 一起选中，分组导入由导入器负责）；
-//  · 导入成功即写入文档并落盘，主界面的文档监听把图层加进地图。
-// 入口参数 tab 决定初始类型；导入完成后写入 PageData 供主界面缩放到新图层四至（等价 Android 行为）。
+// Android 自研文件管理器可原地引用沙箱外路径；鸿蒙沙箱不允许应用遍历公共目录，须先经系统选择器
+// 拿授权再拷入沙箱 调查宝/layer/。关键约束：手机 FILE 选择器只授权「点中的单个文件」，未选中的
+// 同名附属（.dbf/.shx/.prj…）直读必被拒——故主链路走 FOLDER 目录授权（API26 手机支持）：
+//  · 选文件夹 → 应用内只列主数据文件（shp/kml/zip/tif…）→ 勾选 → 在授权目录下自动收齐同名附属整族拷入；
+//  · 旧系统无 FolderSelection 能力时降级 FILE 多选（附属需手动一并选中）。
+// 同名冲突弹「重新导入 / 重命名导入」；导入成功写文档落盘，主界面监听把图层加进地图并缩放到四至。
+// 入口参数 tab 决定初始类型；导入完成后写入 PageData 供主界面缩放（等价 Android 行为）。
 
 import { picker } from '@kit.CoreFileKit';
 import { common } from '@kit.AbilityKit';
@@ -16,12 +16,11 @@ import { Theme } from '../common/Theme';
 import { Ui } from '../common/Ui';
 import { LayerInfo } from '../doc/DocModels';
 import { DocumentManager } from '../doc/DocumentManager';
-import { ImportResult, VectorFileImporter } from '../vector/VectorFileImporter';
+import { ImportResult, VectorFileImporter, ImportCandidate } from '../vector/VectorFileImporter';
 import { LayerType, VectorFormats } from '../vector/VectorFormats';
 import { TitleBar } from '../components/TitleBar';
-
-/** 单次最多可选文件数（shp 家族一次 4~5 个，留出批量图层导入余量） */
-const MAX_SELECT_NUMBER: number = 64;
+import { NameEditDialog } from '../components/NameEditDialog';
+import { FolderFilePickDialog } from '../components/FolderFilePickDialog';
 
 @Entry
 @Component
@@ -30,10 +29,16 @@ struct AddLayerPage {
   @StorageProp('bottomInsetVp') bottomInset: number = 0;
   @State isVector: boolean = true;
   @State busy: boolean = false;
+  /** 本机是否支持 FOLDER 目录授权（API26 手机起支持；旧系统降级 FILE 多选） */
+  @State folderSupported: boolean = false;
   /** 已成功导入的图层名（本页内的即时反馈清单，离开页面即失） */
   @State imported: string[] = [];
+  /** 弹窗控制器须挂成员字段：局部变量持有的控制器不会被框架注入弹窗（this.controller 为 undefined 致 close 崩溃） */
+  private folderPickDialog: CustomDialogController | null = null;
+  private nameDialog: CustomDialogController | null = null;
 
   aboutToAppear(): void {
+    this.folderSupported = canIUse('SystemCapability.FileManagement.UserFileService.FolderSelection');
     const raw: Object = router.getParams();
     if (raw === undefined || raw === null) {
       return;
@@ -51,16 +56,6 @@ struct AddLayerPage {
     return VectorFormats.pickFilter(this.isVector ? LayerType.VECTOR : LayerType.RASTER);
   }
 
-  /** 选择器扩展名过滤：DocumentViewPicker 要求以 '.' 起始的后缀数组 */
-  private suffixFilters(): string[] {
-    const out: string[] = [];
-    const exts: string[] = this.supportedExts();
-    for (let i = 0; i < exts.length; i++) {
-      out.push(`.${exts[i]}`);
-    }
-    return out;
-  }
-
   private switchType(toVector: boolean): void {
     if (toVector === this.isVector) {
       return;
@@ -76,14 +71,11 @@ struct AddLayerPage {
     try {
       const ctx: common.UIAbilityContext =
         this.getUIContext().getHostContext() as common.UIAbilityContext;
-      const options: picker.DocumentSelectOptions = new picker.DocumentSelectOptions();
-      options.maxSelectNumber = MAX_SELECT_NUMBER;
-      options.fileSuffixFilters = this.suffixFilters();
-      const uris: string[] = await new picker.DocumentViewPicker(ctx).select(options);
-      if (uris === undefined || uris.length === 0) {
-        return;
+      if (this.folderSupported) {
+        await this.pickFromFolder(ctx);
+      } else {
+        await this.pickFilesFallback(ctx);
       }
-      await this.doImport(uris);
     } catch (e) {
       Ui.toast(`选择文件失败：${e}`);
     } finally {
@@ -91,11 +83,103 @@ struct AddLayerPage {
     }
   }
 
-  /** 导入 → 写文档 → 落盘；同类型重复导入按路径去重（同 Android：已存在则不再追加） */
-  private async doImport(uris: string[]): Promise<void> {
-    const results: ImportResult[] = await VectorFileImporter.importPicked(uris);
-    if (results.length === 0) {
-      Ui.toast('未导入任何图层');
+  /**
+   * 主链路：FOLDER 目录授权 → 应用内只列主数据文件 → 勾选 → 授权目录下自动收同名附属整族导入。
+   * 目录枚举失败（能力命中但系统未真正放行）时降级 FILE 多选，保证仍可导入。
+   */
+  private async pickFromFolder(ctx: common.UIAbilityContext): Promise<void> {
+    const options: picker.DocumentSelectOptions = new picker.DocumentSelectOptions();
+    options.selectMode = picker.DocumentSelectMode.FOLDER;
+    const folders: string[] = await new picker.DocumentViewPicker(ctx).select(options);
+    if (folders === undefined || folders.length === 0) {
+      return;
+    }
+    const folderUri: string = folders[0];
+    const mains: string[] = VectorFileImporter.listMainInFolder(folderUri, !this.isVector);
+    if (mains.length === 0) {
+      Ui.toast('该文件夹内无可导入数据（或目录读取受限），改用文件选择');
+      await this.pickFilesFallback(ctx);
+      return;
+    }
+    const folderName: string = VectorFileImporter.fileNameOfUri(folderUri);
+    const picked: string[] = await this.askPickFiles(folderName, mains);
+    if (picked.length === 0) {
+      return;
+    }
+    const candidates: ImportCandidate[] = VectorFileImporter.planSources(picked);
+    for (let i = 0; i < candidates.length; i++) {
+      candidates[i].sideCars = VectorFileImporter.collectFolderSiblings(candidates[i].mainUri);
+    }
+    await this.doImportCandidates(candidates);
+  }
+
+  /** 旧系统降级：FILE 多选（只列主文件；附属需用户手动一并选中，分组导入由导入器负责） */
+  private async pickFilesFallback(ctx: common.UIAbilityContext): Promise<void> {
+    const options: picker.DocumentSelectOptions = new picker.DocumentSelectOptions();
+    options.maxSelectNumber = 64;
+    options.fileSuffixFilters = this.mainSuffixFilters();
+    const uris: string[] = await new picker.DocumentViewPicker(ctx).select(options);
+    if (uris === undefined || uris.length === 0) {
+      return;
+    }
+    const candidates: ImportCandidate[] = VectorFileImporter.planSources(uris);
+    await this.doImportCandidates(candidates);
+  }
+
+  /** 文件夹内主文件勾选框：确定返回勾选 URI，取消/遮罩返回空数组 */
+  private askPickFiles(folderName: string, files: string[]): Promise<string[]> {
+    return new Promise<string[]>((resolve: (v: string[]) => void): void => {
+      let settled: boolean = false;
+      const finish = (v: string[]): void => {
+        if (!settled) {
+          settled = true;
+          this.folderPickDialog?.close();
+          resolve(v);
+        }
+      };
+      const dlg: CustomDialogController = new CustomDialogController({
+        builder: FolderFilePickDialog({
+          folderName: folderName,
+          files: files,
+          onPick: (uris: string[]): void => {
+            finish(uris);
+          },
+          onCancel: (): void => {
+            finish([]);
+          },
+        }),
+        customStyle: true,
+        alignment: DialogAlignment.Center,
+        autoCancel: true,
+        cancel: (): void => {
+          finish([]);
+        },
+      });
+      this.folderPickDialog = dlg;
+      dlg.open();
+    });
+  }
+
+  /** 选择器只放行主数据扩展名（矢量/栅格白名单），附属文件不列出（FILE 降级时附属需手动多选） */
+  private mainSuffixFilters(): string[] {
+    const exts: string[] = this.isVector ? VectorFormats.VECTOR_EXTS : VectorFormats.RASTER_EXTS;
+    const out: string[] = [];
+    for (let i = 0; i < exts.length; i++) {
+      out.push(`.${exts[i]}`);
+    }
+    return out;
+  }
+
+  /**
+   * 候选式导入：先规划（不拷贝）→ 逐个判同名冲突 → 按用户选择落盘 → 写文档落盘。
+   *  · 无冲突：整族拷入 + 新增层；
+   *  · 同名冲突：重新导入（覆盖 + styleVersion+1 触发墓碑换层刷新，保留样式）/ 重命名导入（另存新层）/ 取消；
+   *  · 归档 zip/kmz：走既有解压链路（自带 _2 避重），不做同名弹框。
+   * 矢量/栅格按各自主文件类型路由，不受当前页签限制。
+   */
+  private async doImportCandidates(candidates: ImportCandidate[]): Promise<void> {
+    if (candidates.length === 0) {
+      Ui.toast('文件夹内无可导入数据');
       return;
     }
     const doc = DocumentManager.getInstance().getDocument();
@@ -103,30 +187,81 @@ struct AddLayerPage {
       Ui.toast('地图文档未就绪');
       return;
     }
-    const target: LayerInfo[] = this.isVector ? doc.vectorLayers : doc.rasterLayers;
-    const type: string = this.isVector ? LayerInfo.TYPE_VECTOR : LayerInfo.TYPE_RASTER;
-    const names: string[] = [];
+    const added: string[] = [];
     let lastPath: string = '';
-    for (let i = 0; i < results.length; i++) {
-      const r: ImportResult = results[i];
-      let exists: boolean = false;
-      for (let j = 0; j < target.length; j++) {
-        if (target[j].path === r.path) {
-          exists = true;
-          break;
+    for (let i = 0; i < candidates.length; i++) {
+      const c: ImportCandidate = candidates[i];
+      if (VectorFormats.isArchive(c.mainUri)) {
+        const rs: ImportResult[] = await VectorFileImporter.importOne(c.mainUri);
+        for (let j = 0; j < rs.length; j++) {
+          const r: ImportResult = rs[j];
+          const target: LayerInfo[] = VectorFormats.isRaster(r.path) ? doc.rasterLayers : doc.vectorLayers;
+          const type: string = VectorFormats.isRaster(r.path) ? LayerInfo.TYPE_RASTER : LayerInfo.TYPE_VECTOR;
+          let exists: boolean = false;
+          for (let k = 0; k < target.length; k++) {
+            if (target[k].path === r.path) {
+              exists = true;
+              break;
+            }
+          }
+          if (!exists) {
+            target.push(new LayerInfo(r.name, r.path, type, true));
+            added.push(r.name);
+            lastPath = r.path;
+          }
         }
-      }
-      if (exists) {
-        // 已在本工程内：只更新显示名，不重复加层（避免同一文件产生两个渲染层）
         continue;
       }
-      target.push(new LayerInfo(r.name, r.path, type, true));
-      names.push(r.name);
-      lastPath = r.path;
+      const raster: boolean = VectorFormats.isRaster(c.mainUri);
+      const target: LayerInfo[] = raster ? doc.rasterLayers : doc.vectorLayers;
+      const type: string = raster ? LayerInfo.TYPE_RASTER : LayerInfo.TYPE_VECTOR;
+      const existing: LayerInfo | undefined = this.findConflict(target, c.name);
+      if (existing === undefined) {
+        const r: ImportResult | null = VectorFileImporter.importGroup(c, c.name);
+        if (r !== null) {
+          target.push(new LayerInfo(r.name, r.path, type, true));
+          added.push(r.name);
+          lastPath = r.path;
+        } else {
+          Ui.toast(`导入失败：${c.name}`);
+        }
+        continue;
+      }
+      const choice: number = await Ui.items(`图层「${c.name}」已存在`, ['重新导入', '重命名导入', '取消']);
+      if (choice === 0) {
+        // 重新导入：整族覆盖 + styleVersion+1 → syncVectorLayers 墓碑旧层重挂，native 重开刷新（无需重启）
+        const r: ImportResult | null = VectorFileImporter.importGroup(c, c.name);
+        if (r !== null) {
+          existing.path = r.path;
+          existing.styleVersion += 1;
+          added.push(c.name);
+          lastPath = r.path;
+        } else {
+          Ui.toast(`重新导入失败：${c.name}`);
+        }
+      } else if (choice === 1) {
+        const def: string = this.uniqueName(target, c.name);
+        const newName: string = await this.askNewName(def);
+        if (newName.length === 0) {
+          continue;
+        }
+        if (this.findConflict(target, newName) !== undefined) {
+          Ui.toast('名称仍重复，已跳过');
+          continue;
+        }
+        const r: ImportResult | null = VectorFileImporter.importGroup(c, newName);
+        if (r !== null) {
+          target.push(new LayerInfo(r.name, r.path, type, true));
+          added.push(r.name);
+          lastPath = r.path;
+        } else {
+          Ui.toast(`导入失败：${newName}`);
+        }
+      }
     }
     DocumentManager.getInstance().save();
-    if (names.length === 0) {
-      Ui.toast('这些图层已存在');
+    if (added.length === 0) {
+      Ui.toast('未导入任何图层');
       return;
     }
     PageData.put(PageKeys.IMPORTED_LAYER_PATH, lastPath);
@@ -134,11 +269,67 @@ struct AddLayerPage {
     for (let i = 0; i < this.imported.length; i++) {
       merged.push(this.imported[i]);
     }
-    for (let i = 0; i < names.length; i++) {
-      merged.push(names[i]);
+    for (let i = 0; i < added.length; i++) {
+      merged.push(added[i]);
     }
     this.imported = merged;
-    Ui.toast(`已导入 ${names.length} 个图层`);
+    Ui.toast(`已导入 ${added.length} 个图层`);
+  }
+
+  /** 同类型图层列表里按显示名查冲突层（无则 undefined） */
+  private findConflict(layers: LayerInfo[], name: string): LayerInfo | undefined {
+    for (let i = 0; i < layers.length; i++) {
+      if (layers[i].displayName() === name) {
+        return layers[i];
+      }
+    }
+    return undefined;
+  }
+
+  /** 生成不冲突的默认新名：base_1、base_2… */
+  private uniqueName(layers: LayerInfo[], base: string): string {
+    let seq: number = 1;
+    let cand: string = `${base}_${seq}`;
+    while (this.findConflict(layers, cand) !== undefined) {
+      seq++;
+      cand = `${base}_${seq}`;
+    }
+    return cand;
+  }
+
+  /** 重命名输入框：确定返回新名，取消/遮罩返回空串（复用 NameEditDialog） */
+  private askNewName(initial: string): Promise<string> {
+    return new Promise<string>((resolve: (v: string) => void): void => {
+      let settled: boolean = false;
+      const finish = (v: string): void => {
+        if (!settled) {
+          settled = true;
+          resolve(v);
+        }
+      };
+      const dlg: CustomDialogController = new CustomDialogController({
+        builder: NameEditDialog({
+          title: '重命名导入',
+          label: '新名称',
+          placeholder: '请输入新名称',
+          initialValue: initial,
+          onConfirmName: (name: string): void => {
+            finish(name);
+          },
+          onCancel: (): void => {
+            finish('');
+          },
+        }),
+        customStyle: true,
+        alignment: DialogAlignment.Center,
+        autoCancel: true,
+        cancel: (): void => {
+          finish('');
+        },
+      });
+      this.nameDialog = dlg;
+      dlg.open();
+    });
   }
 
   build() {
@@ -158,16 +349,15 @@ struct AddLayerPage {
         .width('100%')
         .padding({ left: Theme.PAD, right: Theme.PAD, top: 10 })
 
-      Text(this.isVector
-        ? '提示：shp 请同时选中 .shp/.dbf/.shx/.prj（可一次多选），压缩包 zip/kmz 会自动解压。\n'
-          + '导入后的文件会复制到应用数据目录「调查宝/layer」，与原文件不再关联。'
-        : '提示：tif/tiff/img 需与同名投影/金字塔文件（.tfw/.ovr 等）一起选中。')
+      Text('提示：先选数据所在文件夹，列表只列主数据文件（shp/kml/zip 等），勾选后自动收齐'
+        + '同目录同名附属（.dbf/.shx/.prj 等），zip/kmz 自动解压。\n同名图层可选「重新导入」覆盖刷新或「重命名导入」另存。'
+        + '导入后的文件复制到应用数据目录「调查宝/layer」，与原文件不再关联。')
         .fontSize(Theme.FONT_SUB)
         .fontColor(Theme.TEXT_HINT)
         .width('100%')
         .padding({ left: Theme.PAD, right: Theme.PAD, top: 6 })
 
-      Button(this.busy ? '正在导入…' : '选择文件')
+      Button(this.busy ? '正在导入…' : (this.folderSupported ? '选择数据文件夹' : '选择数据文件'))
         .width('100%')
         .height(44)
         .fontSize(Theme.FONT)

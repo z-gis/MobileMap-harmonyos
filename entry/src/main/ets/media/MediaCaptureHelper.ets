@@ -4,9 +4,16 @@
 // 多张照片作为同一点位的多个附件保存；附件文件落沙箱 调查宝/Media/<点位ID>/IMG_yyyyMMdd_HHmmss.jpg，
 // 照片本体经 ProjectManager.addPhotoAttachment 增量入库 gpkg BLOB，库提交成功后源文件自动删除。
 //
+// 点位坐标只有「会话起点」一个来源口径：定位拍照按钮走 launchPhotoCapture（取当前定位，
+// 未定位成功不建点）；地图长按空白落点走 startSessionAt（调用方给经纬度，与定位无关，即兴趣点）；
+// 相册选图走 addPhotosFromAlbum（同样按落点建点，照片来自图库，不加水印、时间记入库时刻）。
+// 会话期内该坐标不变，水印按它落字，故不随单张照片的清理复位（连拍第 2 张起仍须有坐标）。
+//
 // 平台差异：
 //   调起相机 Android 用 ACTION_IMAGE_CAPTURE + FileProvider；鸿蒙用 cameraPicker.pick + saveUri，
 //     系统相机应用直接把照片写入该 URI，回调仅返回结果码与 URI（无 ActivityResult）。
+//   相册选图 Android 用 ACTION_PICK + MediaStore  URI；鸿蒙用 photoAccessHelper.PhotoViewPicker，
+//     返回的是媒体库 URI（无沙箱路径），只能按 URI 打开，故必须先拷进会话目录再走 BLOB 入库。
 //   权限 picker 由系统相机进程完成取景拍照，应用侧无需 CAMERA 权限（清单声明仅作说明用途），
 //     故不再走 Android 的「先申请相机权限再调起」分支。
 //   弹窗 Android 用 AlertDialog/MediaEditDialog；鸿蒙普通类无法弹自定义对话框，
@@ -16,6 +23,7 @@
 import { camera, cameraPicker } from '@kit.CameraKit';
 import { common } from '@kit.AbilityKit';
 import fs from '@ohos.file.fs';
+import photoAccessHelper from '@ohos.file.photoAccessHelper';
 import { fileUri } from '@kit.CoreFileKit';
 import { AppDirs } from '../common/AppDirs';
 import { AppLog } from '../common/AppLog';
@@ -33,10 +41,11 @@ const TAG: string = 'MediaCapture';
 export class MediaCaptureHelper {
   /** 当前会话点位主键，-1 表示无会话 */
   private sessionPlacemarkId: number = -1;
-  /** 本次拍摄的目标文件路径与坐标（调起相机前确定，回调后据此落库） */
+  /** 会话点位坐标（建会话时定，整个连拍期不变；水印按它落字，不能随单张清理） */
+  private sessionLat: number = Number.NaN;
+  private sessionLon: number = Number.NaN;
+  /** 本次拍摄的目标文件路径（调起相机前确定，回调后据此落库） */
   private pendingCapturePath: string = '';
-  private pendingCaptureLat: number = Number.NaN;
-  private pendingCaptureLon: number = Number.NaN;
   private readonly ctx: common.UIAbilityContext;
 
   /** 媒体数据变化（新增/删除附件、点位名称或分组变更）后回调，页面据此刷新标注 */
@@ -56,33 +65,149 @@ export class MediaCaptureHelper {
   /** 结束当前连拍会话（不含删除，空点位清理由 cleanupEmptySessionPlacemark 负责） */
   resetSession(): void {
     this.sessionPlacemarkId = -1;
+    this.sessionLat = Number.NaN;
+    this.sessionLon = Number.NaN;
     this.clearPendingCapture();
   }
 
   /**
-   * 启动拍照：会话首张固定坐标并建点位 → 准备附件文件 → 调起系统相机。
+   * 启动拍照（定位坐标口径，拍照按钮走这条）：已在会话中则直接拍下一张；
+   * 无会话时取当前定位坐标建点，未定位成功不建点。
    */
   async launchPhotoCapture(): Promise<void> {
+    if (this.sessionPlacemarkId >= 0) {
+      await this.captureNext();
+      return;
+    }
+    const location: LocationPoint | null = LocationManager.getInstance().getLastLocation();
+    if (location === null) {
+      Ui.toastLong('尚未定位成功，无法标注照片位置');
+      return;
+    }
+    await this.startSessionAt(location.latitude, location.longitude, '拍照');
+  }
+
+  /**
+   * 以指定坐标起拍照会话（地图落点用，不依赖定位）：建点位 → 拍第一张。
+   * 已有会话时拒绝——否则本次照片会并入上一个点位，归属不可控。
+   * @param namePrefix 点位默认名前缀（定位拍照「拍照」、落点兴趣点「兴趣点」）
+   */
+  async startSessionAt(lat: number, lon: number, namePrefix: string): Promise<void> {
+    if (this.sessionPlacemarkId >= 0) {
+      Ui.toast('请先完成当前连拍');
+      return;
+    }
+    const now: number = Date.now();
+    this.sessionLat = lat;
+    this.sessionLon = lon;
+    this.sessionPlacemarkId = await ProjectManager.get(this.ctx).addPhoto(
+      Ui.stampName(namePrefix, now), lat, lon, now);
     if (this.sessionPlacemarkId < 0) {
-      const location: LocationPoint | null = LocationManager.getInstance().getLastLocation();
-      if (location === null) {
-        Ui.toastLong('尚未定位成功，无法标注照片位置');
+      Ui.toast('创建拍照记录失败');
+      return;
+    }
+    await this.captureNext();
+  }
+
+  /**
+   * 从相册选图建/补兴趣点：不调相机、不依赖定位，选中照片作为当前点位的附件入库。
+   * 无会话时按落点坐标新建点位（兴趣点口径）；已在会话中则并入当前会话点位，与连拍同归属。
+   * 取消选择或全部读取失败 → 走空点位清理，不留没有照片的标注。
+   * 相册原图不带本应用坐标，故不加水印、capturedAt 记本次入库时刻。
+   */
+  async addPhotosFromAlbum(lat: number, lon: number, namePrefix: string): Promise<void> {
+    const pm: ProjectManager = ProjectManager.get(this.ctx);
+    if (this.sessionPlacemarkId < 0) {
+      const now: number = Date.now();
+      const placemarkId: number = await pm.addPhoto(Ui.stampName(namePrefix, now), lat, lon, now);
+      if (placemarkId < 0) {
+        Ui.toast('创建兴趣点失败');
         return;
       }
-      this.pendingCaptureLat = location.latitude;
-      this.pendingCaptureLon = location.longitude;
-
-      const now: number = Date.now();
-      this.sessionPlacemarkId = await ProjectManager.get(this.ctx).addPhoto(
-        MediaCaptureHelper.formatPlacemarkName(now),
-        this.pendingCaptureLat, this.pendingCaptureLon, now);
-      if (this.sessionPlacemarkId < 0) {
-        Ui.toast('创建拍照记录失败');
-        return;
+      this.sessionLat = lat;
+      this.sessionLon = lon;
+      this.sessionPlacemarkId = placemarkId;
+    }
+    const uris: string[] = await this.pickAlbumImageUris();
+    if (uris.length === 0) {
+      await this.cleanupEmptySessionPlacemark();
+      return;
+    }
+    let saved: number = 0;
+    for (const uri of uris) {
+      if (await this.attachAlbumPhoto(uri)) {
+        saved++;
       }
     }
+    if (saved === 0) {
+      await this.cleanupEmptySessionPlacemark();
+      Ui.toast('相册照片读取失败');
+      return;
+    }
+    await pm.saveNow();
+    this.onMediaChanged();
+    Ui.toast(`已添加 ${saved} 张相册照片`);
+    await this.finishSession();
+  }
 
-    const outPath: string = this.nextCaptureFilePath();
+  /** 拉起相册选择器（PhotoViewPicker 免权限）；取消或异常返回空数组 */
+  private async pickAlbumImageUris(): Promise<string[]> {
+    try {
+      const options: photoAccessHelper.PhotoSelectOptions = {
+        MIMEType: photoAccessHelper.PhotoViewMIMETypes.IMAGE_TYPE,
+        maxSelectNumber: 9,
+      };
+      const result: photoAccessHelper.PhotoSelectResult =
+        await new photoAccessHelper.PhotoViewPicker().select(options);
+      return result.photoUris;
+    } catch (e) {
+      AppLog.e('相册选图取消/失败', e);
+      return [];
+    }
+  }
+
+  /**
+   * 把一张相册 URI 拷进会话目录再入库。picker 授予的是所选 URI 的临时读权限，
+   * 只能按 URI 打开、不能按路径访问，故必须先落到沙箱再走 addPhotoAttachment。
+   */
+  private async attachAlbumPhoto(uri: string): Promise<boolean> {
+    const outPath: string = this.nextCaptureFilePath('ALB');
+    if (outPath.length === 0) {
+      return false;
+    }
+    if (!MediaCaptureHelper.prepareFile(outPath)) {
+      Ui.toast('创建媒体文件失败');
+      return false;
+    }
+    let src: fs.File | null = null;
+    let dst: fs.File | null = null;
+    try {
+      src = fs.openSync(uri, fs.OpenMode.READ_ONLY);
+      dst = fs.openSync(outPath, fs.OpenMode.READ_WRITE | fs.OpenMode.CREATE);
+      fs.copyFileSync(src.fd, dst.fd);
+      if (fs.statSync(dst.fd).size <= 0) {
+        throw new Error('相册照片内容为空');
+      }
+    } catch (e) {
+      AppLog.e('相册照片拷贝失败', e);
+      if (src !== null) fs.closeSync(src);
+      if (dst !== null) fs.closeSync(dst);
+      AppDirs.removeFile(outPath);
+      return false;
+    }
+    fs.closeSync(src);
+    fs.closeSync(dst);
+    const capturedAt: number = Date.now();
+    await ProjectManager.get(this.ctx).addPhotoAttachment(
+      this.sessionPlacemarkId, MediaCaptureHelper.nameOfPath(outPath), outPath, capturedAt);
+    return true;
+  }
+
+  /**
+   * 拍下一张：准备附件文件 → 调起系统相机（会话点位须已存在）。
+   */
+  private async captureNext(): Promise<void> {
+    const outPath: string = this.nextCaptureFilePath('IMG');
     if (outPath.length === 0) {
       return;
     }
@@ -137,7 +262,7 @@ export class MediaCaptureHelper {
     const watermarkEnabled: boolean = doc === null ? true : doc.systemConfig.photoAddWatermark;
     if (watermarkEnabled) {
       const stamped: boolean = await MediaWatermark.addCoordinateWatermark(
-        path, this.pendingCaptureLat, this.pendingCaptureLon, capturedAt);
+        path, this.sessionLat, this.sessionLon, capturedAt);
       if (!stamped) {
         Ui.toastLong('照片已保存，但添加坐标水印失败');
       }
@@ -210,20 +335,18 @@ export class MediaCaptureHelper {
     return `${AppDirs.mediaDir()}/${this.sessionPlacemarkId}`;
   }
 
-  /** 生成下一张照片的目标路径；目录创建失败返回空串并已提示 */
-  private nextCaptureFilePath(): string {
+  /** 生成下一张附件的目标路径；目录创建失败返回空串并已提示。@param prefix 相机 IMG / 相册 ALB */
+  private nextCaptureFilePath(prefix: string): string {
     const dir: string = this.sessionDir();
     if (AppDirs.ensureDir(dir).length === 0 || !AppDirs.exists(dir)) {
       Ui.toast('创建媒体目录失败');
       return '';
     }
-    return `${dir}/IMG_${MediaCaptureHelper.fileStamp(Date.now())}.jpg`;
+    return `${dir}/${prefix}_${MediaCaptureHelper.fileStamp(Date.now())}.jpg`;
   }
 
   private clearPendingCapture(): void {
     this.pendingCapturePath = '';
-    this.pendingCaptureLat = Number.NaN;
-    this.pendingCaptureLon = Number.NaN;
   }
 
   /** 建空文件（picker 要求目标存在且可写），失败返回 false */
@@ -249,10 +372,5 @@ export class MediaCaptureHelper {
     const p = (n: number): string => n < 10 ? `0${n}` : `${n}`;
     return `${d.getFullYear()}${p(d.getMonth() + 1)}${p(d.getDate())}`
       + `_${p(d.getHours())}${p(d.getMinutes())}${p(d.getSeconds())}`;
-  }
-
-  /** 会话点位默认时间名：`拍照 yyyy-MM-dd HH:mm:ss` */
-  static formatPlacemarkName(time: number): string {
-    return Ui.stampName('拍照', time);
   }
 }

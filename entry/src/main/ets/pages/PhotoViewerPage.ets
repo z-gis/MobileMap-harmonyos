@@ -237,6 +237,15 @@ struct PhotoViewerPage {
                   this.offsetX = c[0];
                   this.offsetY = c[1];
                 }))
+              // 未放大时拒绝本图单指平移识别，把横向滑动让给 Swiper 翻页（等价 Android
+              // requestDisallowInterceptTouchEvent：未放大可翻页，放大后才平移）
+              .onGestureRecognizerJudgeBegin((_event: BaseGestureEvent, current: GestureRecognizer,
+                _recognizers: Array<GestureRecognizer>): GestureJudgeResult => {
+                if (current.getType() === GestureControl.GestureType.PAN_GESTURE && this.zoomScale <= MIN_SCALE) {
+                  return GestureJudgeResult.REJECT;
+                }
+                return GestureJudgeResult.CONTINUE;
+              })
           }, (path: string, index: number): string => `${index}|${path}`)
         }
         .width('100%')

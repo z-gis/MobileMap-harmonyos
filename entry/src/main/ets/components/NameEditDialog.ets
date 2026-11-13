@@ -21,6 +21,8 @@ export struct NameEditDialog {
   initialValue: string = '';
   /** 确定回调（已 trim 且非空） */
   onConfirmName: (name: string) => void = (): void => {};
+  /** 取消回调（点「取消」按钮时触发；遮罩/返回取消由控制器 cancel 处理） */
+  onCancel: () => void = (): void => {};
 
   @State text: string = '';
 
@@ -72,6 +74,7 @@ export struct NameEditDialog {
           .fontColor(Theme.TEXT_SUB)
           .backgroundColor(Theme.SUBTLE)
           .onClick((): void => {
+            this.onCancel();
             this.controller.close();
           })
         Button('确定')

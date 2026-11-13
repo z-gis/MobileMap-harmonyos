@@ -33,6 +33,13 @@ export interface LayerInfoJson {
   autoMinDisplayLevel?: number;
   userMinDisplayLevel?: number;
   vectorStyle?: StyleOverrideJson;
+  groupId?: number;
+}
+
+/** 图层分组（与 Android LayerGroup 字段一致）：只存 id/name，组可见性由成员 visible 派生 */
+export interface LayerGroupJson {
+  id?: number;
+  name?: string;
 }
 
 export interface MapSourceJson {
@@ -68,6 +75,7 @@ export interface MapDocumentJson {
   mapSources?: MapSourceJson[];
   rasterLayers?: LayerInfoJson[];
   vectorLayers?: LayerInfoJson[];
+  groups?: LayerGroupJson[];
   camLatitude?: number;
   camLongitude?: number;
   camAltitude?: number;
@@ -265,12 +273,16 @@ export class LayerInfo {
   static readonly DEFAULT_MIN_DISPLAY_LEVEL: number = 5;
   /** 未初始化 / 未指定的哨兵值 */
   static readonly UNSET_LEVEL: number = -1;
+  /** 未分组哨兵值（与拍照 UNGROUPED_ID 同口径） */
+  static readonly UNGROUPED_ID: number = -1;
 
   name: string | undefined = undefined;
   path: string | undefined = undefined;
   visible: boolean = true;
   type: string | undefined = undefined;
   vectorStyle: StyleOverride | undefined = undefined;
+  /** 所属分组 id；-1 = 未分组。组纯组织管理，不影响压盖顺序 */
+  groupId: number = LayerInfo.UNGROUPED_ID;
   /** 样式版本号：样式修改时递增，驱动已加载图层重载生效（图层同步缓存键之一） */
   styleVersion: number = 0;
   /** 级别可见性——自动值（-1 表示未初始化） */
@@ -327,6 +339,9 @@ export class LayerInfo {
     if (this.userMinDisplayLevel !== LayerInfo.UNSET_LEVEL) {
       o.userMinDisplayLevel = this.userMinDisplayLevel;
     }
+    if (this.groupId !== LayerInfo.UNGROUPED_ID) {
+      o.groupId = this.groupId;
+    }
     const style: StyleOverride | undefined = this.vectorStyle;
     if (style !== undefined && !style.isEmpty()) {
       o.vectorStyle = style.toJson();
@@ -339,6 +354,7 @@ export class LayerInfo {
     l.styleVersion = o.styleVersion ?? 0;
     l.autoMinDisplayLevel = o.autoMinDisplayLevel ?? LayerInfo.UNSET_LEVEL;
     l.userMinDisplayLevel = o.userMinDisplayLevel ?? LayerInfo.UNSET_LEVEL;
+    l.groupId = o.groupId ?? LayerInfo.UNGROUPED_ID;
     if (o.vectorStyle !== undefined) {
       l.vectorStyle = StyleOverride.fromJson(o.vectorStyle);
     }
@@ -480,6 +496,25 @@ export class SystemConfig {
   }
 }
 
+/** 图层分组记录：组可见性不存盘，由组内成员 visible 派生（allVisible），开关即扇出写成员 */
+export class LayerGroupRecord {
+  id: number = 0;
+  name: string = '';
+
+  constructor(id: number = 0, name: string = '') {
+    this.id = id;
+    this.name = name;
+  }
+
+  toJson(): LayerGroupJson {
+    return { id: this.id, name: this.name };
+  }
+
+  static fromJson(o: LayerGroupJson): LayerGroupRecord {
+    return new LayerGroupRecord(o.id ?? 0, o.name ?? '');
+  }
+}
+
 /** 地图文档：document.json 的完整内存表示 */
 export class MapDocument {
   static readonly CURRENT_VERSION: number = 1;
@@ -488,6 +523,8 @@ export class MapDocument {
   vectorLayers: LayerInfo[] = [];
   rasterLayers: LayerInfo[] = [];
   mapSources: MapSource[] = [];
+  /** 图层分组，数组序 = 创建序 = 列表节序；旧文档缺省为空 = 全部未分组 */
+  groups: LayerGroupRecord[] = [];
   systemConfig: SystemConfig = new SystemConfig();
 
   /** 相机完整姿态；NaN 表示未记录，序列化时跳过 */
@@ -523,6 +560,7 @@ export class MapDocument {
       mapSources: this.mapSources.map((s: MapSource) => s.toJson()),
       rasterLayers: this.rasterLayers.map((l: LayerInfo) => l.toJson()),
       vectorLayers: this.vectorLayers.map((l: LayerInfo) => l.toJson()),
+      groups: this.groups.map((g: LayerGroupRecord) => g.toJson()),
     };
     if (!Number.isNaN(this.camLatitude)) {
       o.camLatitude = this.camLatitude;
@@ -567,6 +605,10 @@ export class MapDocument {
     const vectors: LayerInfoJson[] = o.vectorLayers ?? [];
     for (let i = 0; i < vectors.length; i++) {
       doc.vectorLayers.push(LayerInfo.fromJson(vectors[i]));
+    }
+    const groups: LayerGroupJson[] = o.groups ?? [];
+    for (let i = 0; i < groups.length; i++) {
+      doc.groups.push(LayerGroupRecord.fromJson(groups[i]));
     }
     doc.camLatitude = o.camLatitude ?? Number.NaN;
     doc.camLongitude = o.camLongitude ?? Number.NaN;

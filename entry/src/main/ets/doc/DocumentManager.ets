@@ -16,7 +16,7 @@ import { common } from '@kit.AbilityKit';
 import { AppDirs } from '../common/AppDirs';
 import { AppLog } from '../common/AppLog';
 import { CoordFormatter } from '../common/Coord';
-import { LayerInfo, MapDocument, MapDocumentJson, MapSource, SystemConfig } from './DocModels';
+import { LayerGroupRecord, LayerInfo, MapDocument, MapDocumentJson, MapSource, SystemConfig } from './DocModels';
 
 /** 文档变更监听回调（保存成功后在主线程触发） */
 export type DocumentListener = (doc: MapDocument) => void;
@@ -243,6 +243,90 @@ export class DocumentManager {
         s.token2 = source.token2;
       }
     });
+  }
+
+  // ── 图层分组（组纯组织管理；组可见性扇出写成员 visible，渲染层不认组，与拍照分组同口径）──
+
+  /** 新建分组：id 取现有最大 +1，返回新组 id（文档未加载返回 -1） */
+  addGroup(name: string): number {
+    const doc: MapDocument | null = this.document;
+    if (doc === null) {
+      return -1;
+    }
+    let id: number = 1;
+    for (let i = 0; i < doc.groups.length; i++) {
+      id = Math.max(id, doc.groups[i].id + 1);
+    }
+    this.update((d: MapDocument): void => {
+      d.groups.push(new LayerGroupRecord(id, name));
+    });
+    return id;
+  }
+
+  renameGroup(id: number, name: string): void {
+    this.update((doc: MapDocument): void => {
+      for (let i = 0; i < doc.groups.length; i++) {
+        if (doc.groups[i].id === id) {
+          doc.groups[i].name = name;
+          break;
+        }
+      }
+    });
+  }
+
+  /** 删除分组：成员回落未分组，图层本身不动 */
+  removeGroup(id: number): void {
+    this.update((doc: MapDocument): void => {
+      doc.groups = doc.groups.filter((g: LayerGroupRecord): boolean => g.id !== id);
+      DocumentManager.fanOutGroup(doc, id, LayerInfo.UNGROUPED_ID);
+    });
+  }
+
+  /** 组可见性开关：一次更新批量写组内每层 visible（一次 save 一次 sync） */
+  setGroupLayersVisible(id: number, visible: boolean): void {
+    this.update((doc: MapDocument): void => {
+      const lists: LayerInfo[][] = [doc.vectorLayers, doc.rasterLayers];
+      for (let i = 0; i < lists.length; i++) {
+        for (let j = 0; j < lists[i].length; j++) {
+          if (lists[i][j].groupId === id) {
+            lists[i][j].visible = visible;
+          }
+        }
+      }
+    });
+  }
+
+  /** 图层移入组（-1 = 未分组）；newGroupName 非空时同一次更新内先建组再落入 */
+  moveLayerToGroup(path: string, vector: boolean, groupId: number, newGroupName: string = ''): void {
+    this.update((doc: MapDocument): void => {
+      let target: number = groupId;
+      if (newGroupName.length > 0) {
+        target = 1;
+        for (let i = 0; i < doc.groups.length; i++) {
+          target = Math.max(target, doc.groups[i].id + 1);
+        }
+        doc.groups.push(new LayerGroupRecord(target, newGroupName));
+      }
+      const list: LayerInfo[] = vector ? doc.vectorLayers : doc.rasterLayers;
+      for (let i = 0; i < list.length; i++) {
+        if (list[i].path === path) {
+          list[i].groupId = target;
+          break;
+        }
+      }
+    });
+  }
+
+  /** 把指定组的全部成员改写为目标组 id（删组回落用） */
+  private static fanOutGroup(doc: MapDocument, fromId: number, toId: number): void {
+    const lists: LayerInfo[][] = [doc.vectorLayers, doc.rasterLayers];
+    for (let i = 0; i < lists.length; i++) {
+      for (let j = 0; j < lists[i].length; j++) {
+        if (lists[i][j].groupId === fromId) {
+          lists[i][j].groupId = toId;
+        }
+      }
+    }
   }
 
   // ── 内部 ──────────────────────────────────────────────────────────

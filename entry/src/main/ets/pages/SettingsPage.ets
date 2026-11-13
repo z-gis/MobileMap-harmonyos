@@ -10,6 +10,7 @@ import { router } from '@kit.ArkUI';
 import { common } from '@kit.AbilityKit';
 import { BackgroundLocationController } from '../location/BackgroundLocationController';
 import { Theme } from '../common/Theme';
+import { AppDirs } from '../common/AppDirs';
 import { MapDocument, SystemConfig } from '../doc/DocModels';
 import { DocumentManager } from '../doc/DocumentManager';
 import { SwitchRow } from '../components/SwitchRow';
@@ -33,6 +34,10 @@ struct SettingsPage {
   @State backgroundLocation: boolean = false;
   @State rasterTileCacheEnabled: boolean = true;
   @State tileOfflineOnly: boolean = false;
+  /** 数据根目录（沙箱内「调查宝」）绝对路径：进入页面时取一次，build 内不做文件访问 */
+  @State dataDir: string = '';
+  /** 工程文件（.gpkg）目录绝对路径：与数据根目录不同树，故单独亮出 */
+  @State projectsDir: string = '';
 
   aboutToAppear(): void {
     const config: SystemConfig = DocumentManager.getInstance().getConfig();
@@ -48,6 +53,8 @@ struct SettingsPage {
     this.backgroundLocation = config.backgroundLocation;
     this.rasterTileCacheEnabled = config.rasterTileCacheEnabled;
     this.tileOfflineOnly = config.tileOfflineOnly;
+    this.dataDir = AppDirs.root();
+    this.projectsDir = AppDirs.projectsDir();
   }
 
   /**
@@ -209,6 +216,9 @@ struct SettingsPage {
             },
           })
 
+          this.groupTitle('存储')
+          this.storageCard()
+
           this.groupTitle('关于')
           this.entryRow('使用说明', '界面按键分布、本地图层与自定义地图源的添加步骤', (): void => {
             router.pushUrl({ url: 'pages/HelpPage' });
@@ -237,6 +247,45 @@ struct SettingsPage {
       .fontColor(Theme.TEXT_SUB)
       .width('100%')
       .margin({ top: 8, left: 2 })
+  }
+
+  /**
+   * 存储卡片：把实际生效的数据根目录与工程目录亮给用户（对齐 Android activity_settings 的「存储」分组）。
+   * 文本可长按复制，取数走 hdc / 工程管理「分享·导出副本」。
+   */
+  @Builder
+  storageCard() {
+    Column({ space: 8 }) {
+      this.pathRow('数据目录', this.dataDir)
+      Divider().color(Theme.DIVIDER)
+      this.pathRow('工程目录', this.projectsDir)
+      Text('以上为应用私有目录，系统文件管理器无法直接浏览；成果取出请用工程管理的「分享」或「导出副本」。')
+        .fontSize(Theme.FONT_SUB)
+        .fontColor(Theme.DANGER)
+        .width('100%')
+    }
+    .width('100%')
+    .padding(12)
+    .alignItems(HorizontalAlign.Start)
+    .backgroundColor(Theme.CARD)
+    .borderRadius(Theme.RADIUS)
+  }
+
+  @Builder
+  pathRow(title: string, path: string) {
+    Column() {
+      Text(title)
+        .fontSize(Theme.FONT)
+        .fontColor(Theme.TEXT)
+      Text(path.length === 0 ? '未初始化' : path)
+        .fontSize(Theme.FONT_SUB)
+        .fontColor(Theme.TEXT_SUB)
+        .width('100%')
+        .margin({ top: 4 })
+        .copyOption(CopyOptions.LocalDevice)
+    }
+    .width('100%')
+    .alignItems(HorizontalAlign.Start)
   }
 
   @Builder

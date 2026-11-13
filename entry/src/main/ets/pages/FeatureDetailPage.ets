@@ -10,7 +10,9 @@
 //  · 样地调查入口置于顶栏，始终可见（不受页签切换与编辑门控影响），对齐 surveyBypassEdit。
 // 属性由主地图页异步回取（GDAL 开 KML/DXF 可达秒级），本页可能先于属性显示：
 // 经 PageSignals 收到回填事件后就地重建属性表与标注字段候选（等价 pushAttributes）。
-// 与 Android 的有意差异：KML description 的 HTML 以去标签纯文本展示，不引 Web 组件（内容仅备注级）。
+// 与 Android 的有意差异：KML description 不引 Web 组件。ArcGIS/MapInfo 导出的 KML 无 ExtendedData，
+// 属性整份写在 description 的嵌套 HTML 表里，故先按名/值两列还原成属性表（等价 Android 的 WebView 观感），
+// 还原不出成对行才退回备注级去标签纯文本。
 
 import { router } from '@kit.ArkUI';
 import { ColorHex } from '../common/ColorHex';
@@ -89,6 +91,9 @@ struct FeatureDetailPage {
   @State rows: AttrRow[] = [];
   @State attrsLoading: boolean = false;
   @State descText: string = '';
+  /** description 的 HTML 表格被还原成属性表时的两个附属态：斑马纹开关、顶部显示字段值带 */
+  @State descAsTable: boolean = false;
+  @State descCaption: string = '';
   @State editing: boolean = false;
   @State attrsDirty: boolean = false;
   /** 标注字段候选：图层样式模式取整层字段，单要素模式取属性表字段（回填后刷新） */
@@ -305,15 +310,41 @@ struct FeatureDetailPage {
   private refreshAttrs(): void {
     const attrs: Map<string, string> | null = this.req.attributes;
     this.attrsLoading = attrs === null;
-    const desc: string = this.req.description;
-    this.descText = desc.length > 0 ? FeatureDetailPage.plainOf(desc) : '';
-    const rows: AttrRow[] = [];
-    const fields: string[] = [];
+    // 仅 kml/kmz 的 description 是富内容（HTML）；shp/gpkg 里同名列就是普通可编辑字段
+    const desc: string = VectorFormats.isKml(this.req.path) ? this.req.description : '';
+    // OGR 的 KML 驱动恒给 Name/altitudeMode/tessellate/extrude/visibility/snippet/description 七个字段，
+    // 导出件的 83 个真属性只在 description HTML 里 —— 还原成功就整表顶上（Android WebView 同为整表替换）
+    const realRows: AttrRow[] = [];
     if (attrs !== null) {
       attrs.forEach((value: string, key: string): void => {
-        rows.push(new AttrRow(key, value));
-        fields.push(key);
+        if (desc.length > 0 && key.toLowerCase() === 'description') {
+          // description 已单独取走；留在表里会把整段 HTML 铺成一行
+          return;
+        }
+        realRows.push(new AttrRow(key, value));
       });
+    }
+    const descRows: AttrRow[] = desc.length > 0 ? FeatureDetailPage.descTableOf(desc) : [];
+    const descPairs: AttrRow[] = [];
+    let caption: string = '';
+    for (let i = 0; i < descRows.length; i++) {
+      if (descRows[i].key.length === 0) {
+        if (caption.length === 0) {
+          caption = descRows[i].value;
+        }
+      } else {
+        descPairs.push(descRows[i]);
+      }
+    }
+    const asTable: boolean = descPairs.length > 0;
+    const rows: AttrRow[] = asTable ? descPairs : realRows;
+    this.descAsTable = asTable;
+    this.descCaption = asTable ? caption : '';
+    // 还原成表时备注不叠加；解不出成对行才把 description 当备注整段展示在表上方
+    this.descText = asTable || desc.length === 0 ? '' : FeatureDetailPage.plainOf(desc);
+    const fields: string[] = [];
+    for (let i = 0; i < rows.length; i++) {
+      fields.push(rows[i].key);
     }
     this.rows = rows;
     if (!this.req.layerStyleMode) {
@@ -323,7 +354,8 @@ struct FeatureDetailPage {
 
   /** HTML → 纯文本：换行标签转 \\n，其余标签剥除，常见实体还原（KML description 多为备注片段） */
   private static plainOf(html: string): string {
-    let s: string = html.replace(/<br\s*\/?>/gi, '\n');
+    let s: string = html.replace(/<!\[CDATA\[([\s\S]*?)\]\]>/gi, '$1');
+    s = s.replace(/<br\s*\/?>/gi, '\n');
     s = s.replace(/<\/p>/gi, '\n');
     s = s.replace(/<[^>]*>/g, '');
     s = s.replace(/&nbsp;/gi, ' ');
@@ -332,6 +364,80 @@ struct FeatureDetailPage {
     s = s.replace(/&quot;/gi, '"');
     s = s.replace(/&#39;/gi, "'");
     s = s.replace(/&amp;/gi, '&');
+    s = s.replace(/\n{2,}/g, '\n');
+    return s.trim();
+  }
+
+  /**
+   * KML description 的 HTML 表格 → 属性行，对齐 Android 的 WebView 观感。
+   * 只认最内层 <tr>：ArcGIS/MapInfo 把真表格嵌在外层单格 <tr> 里，外层行没有名值语义。
+   * 行内 2 格=名/值；>2 格=首格作名其余拼接；1 格=显示字段值，key 留空由调用方另作表头带。
+   */
+  private static descTableOf(html: string): AttrRow[] {
+    const rows: AttrRow[] = [];
+    const body: string = html.replace(/<!\[CDATA\[([\s\S]*?)\]\]>/gi, '$1');
+    // <tr>/</tr> 配对扫描：starts 记每行正文起点，hasChild 标记该行是否套了子表
+    const starts: number[] = [];
+    const hasChild: boolean[] = [];
+    let sp: number = 0;
+    const tagRe: RegExp = /<(\/?)tr\b[^>]*>/gi;
+    let tag: RegExpExecArray | null = tagRe.exec(body);
+    while (tag !== null) {
+      if (tag[1] === '/') {
+        if (sp === 0) {
+          return [];
+        }
+        sp--;
+        if (!hasChild[sp]) {
+          const cells: string[] = FeatureDetailPage.cellTextsOf(body.substring(starts[sp], tag.index));
+          if (cells.length === 2) {
+            rows.push(new AttrRow(cells[0], cells[1]));
+          } else if (cells.length === 1 && cells[0].length > 0) {
+            // 单格行是导出器放的显示字段值：无名，key 置空由调用方当表头带用
+            rows.push(new AttrRow('', cells[0]));
+          } else if (cells.length > 2) {
+            let value: string = cells[1];
+            for (let i = 2; i < cells.length; i++) {
+              value = `${value}  ${cells[i]}`;
+            }
+            rows.push(new AttrRow(cells[0], value));
+          }
+        }
+        if (sp > 0) {
+          hasChild[sp - 1] = true;
+        }
+      } else {
+        starts[sp] = tag.index + tag[0].length;
+        hasChild[sp] = false;
+        sp++;
+      }
+      tag = tagRe.exec(body);
+    }
+    return rows;
+  }
+
+  /** 最内层行正文 → 单元格文本（<td>/<th>，容忍大小写与属性） */
+  private static cellTextsOf(trBody: string): string[] {
+    const cells: string[] = [];
+    const cellRe: RegExp = /<t[dh]\b[^>]*>([\s\S]*?)<\/t[dh]>/gi;
+    let m: RegExpExecArray | null = cellRe.exec(trBody);
+    while (m !== null) {
+      cells.push(FeatureDetailPage.cellTextOf(m[1]));
+      m = cellRe.exec(trBody);
+    }
+    return cells;
+  }
+
+  /** 单元格文本：剥内联标签 + 实体还原 + 折叠空白（导出 HTML 标签间全是换行，不折叠会撑成多行） */
+  private static cellTextOf(raw: string): string {
+    let s: string = raw.replace(/<[^>]*>/g, ' ');
+    s = s.replace(/&nbsp;/gi, ' ');
+    s = s.replace(/&lt;/gi, '<');
+    s = s.replace(/&gt;/gi, '>');
+    s = s.replace(/&quot;/gi, '"');
+    s = s.replace(/&#39;/gi, "'");
+    s = s.replace(/&amp;/gi, '&');
+    s = s.replace(/\s+/g, ' ');
     return s.trim();
   }
 
@@ -683,33 +789,48 @@ struct FeatureDetailPage {
   attrsPage() {
     Column() {
       if (this.descText.length > 0) {
-        // KML/KMZ 描述：去标签后整段展示（Android 用 WebView 渲染同一段 HTML）
+        // 备注型 description（解不出名值对的那类）：去标签后整段展示，表格照常在其下方
         Text(this.descText)
           .fontSize(Theme.FONT)
           .fontColor(Theme.TEXT)
           .width('100%')
           .padding(4)
-      } else if (this.rows.length === 0) {
+      }
+      if (this.rows.length === 0 && this.descText.length === 0) {
         Text(this.attrsLoading ? '正在读取属性…' : '该要素暂无属性表')
           .fontSize(Theme.FONT_SUB)
           .fontColor(Theme.TEXT_SUB)
           .width('100%')
           .textAlign(TextAlign.Center)
           .padding(24)
-      } else {
-        Row() {
-          Text('属性名')
-            .fontSize(Theme.FONT_SUB)
-            .fontColor(Theme.TEXT_SUB)
-            .layoutWeight(1)
-          Text('属性值')
-            .fontSize(Theme.FONT_SUB)
-            .fontColor(Theme.TEXT_SUB)
-            .layoutWeight(2)
+      } else if (this.rows.length > 0) {
+        // 导出件 KML 的显示字段值带（Android WebView 里那条蓝底居中行）
+        if (this.descCaption.length > 0) {
+          Text(this.descCaption)
+            .fontSize(Theme.FONT)
+            .fontWeight(FontWeight.Bold)
+            .fontColor(Theme.TEXT)
+            .textAlign(TextAlign.Center)
+            .width('100%')
+            .padding({ top: 6, bottom: 6 })
+            .backgroundColor(Theme.SUBTLE)
         }
-        .width('100%')
-        .padding({ left: 10, right: 10, top: 6, bottom: 6 })
-        .backgroundColor(Theme.SUBTLE)
+        // 键值表头：Android 在 WebView 模式下同样隐藏，还原件 KML 有值带就够了
+        if (!this.descAsTable) {
+          Row() {
+            Text('属性名')
+              .fontSize(Theme.FONT_SUB)
+              .fontColor(Theme.TEXT_SUB)
+              .layoutWeight(1)
+            Text('属性值')
+              .fontSize(Theme.FONT_SUB)
+              .fontColor(Theme.TEXT_SUB)
+              .layoutWeight(2)
+          }
+          .width('100%')
+          .padding({ left: 10, right: 10, top: 6, bottom: 6 })
+          .backgroundColor(Theme.SUBTLE)
+        }
 
         ForEach(this.rows, (row: AttrRow, index: number): void => {
           Row() {
@@ -725,6 +846,7 @@ struct FeatureDetailPage {
           .width('100%')
           .alignItems(VerticalAlign.Top)
           .padding({ left: 10, right: 10, top: 8, bottom: 8 })
+          .backgroundColor(this.descAsTable && index % 2 === 1 ? Theme.SUBTLE : Color.Transparent)
           .border({ width: { bottom: 1 }, color: { bottom: Theme.DIVIDER } })
           .onClick((): void => {
             this.editRow(index);

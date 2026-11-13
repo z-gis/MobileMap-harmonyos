@@ -5,6 +5,10 @@
 //   2) native pickVector 命中业务叠加层 → 按 hitTest 分类路由到测量/轨迹/拍照/样地详情；
 //   3) 命中文件矢量层 → 画黄色选中高亮层 + 弹要素详情（属性后台回取后就地回填）；
 //   4) 未命中 → 取消选中高亮（点空白取消）。
+// 长按地图（onMapLongPress）空白与命中要素都弹圆菜单（同 Android MainActivity.setOnLongPressListener 的分工）：
+// 命中与否作为 hasFeature 一并交宿主，宿主据此决定是否多挂一项「编辑」——一项管落点、一项管要素，
+// 菜单里点「编辑」回到本控制器的 editHitAt，走与单击完全相同的命中分流（测量/轨迹/拍照/样地/文件要素）。
+// 长按在 native 是「按住 500ms 即触发」，抬手那次单击不被 native 否决，故由宿主「菜单是否还浮着」吞掉（见 onMapTap）。
 // 查询高亮层与选中高亮层均置 noPick 不参与 native 拾取（其大面积几何会遮蔽业务叠加与源要素点击），
 // 命中穿透分支仅作防护兜底。
 //
@@ -86,6 +90,19 @@ export class PickRouter {
   onFeatureDetail: (req: FeatureDetailRequest) => void = (): void => {};
   /** 属性回取完成：宿主就地回填已显示的详情层 */
   onFeatureAttributes: (req: FeatureDetailRequest) => void = (): void => {};
+  /**
+   * 长按落点：经纬度已由控制器反算，(xPx, yPx) 是同一次手势的屏幕点（px，native 口径）。
+   * 坐标一并下发是给宿主弹圆菜单当锚点用（ArkUI 浮层要 vp，换算归宿主）。
+   * hasFeature 表示该点命中了要素/叠加：宿主据此在菜单里加一项「编辑」，动作回到 editHitAt。
+   */
+  onDropPoint: (lat: number, lon: number, xPx: number, yPx: number, hasFeature: boolean) => void =
+    (): void => {};
+  /**
+   * 圆菜单此刻是否还浮在地图上（宿主状态）。
+   * 长按抬手补发的那次单击一定落在菜单还浮着的时刻，而菜单浮着时地图本来就不该响应任何单击——
+   * 用它当判据，不限时也不限距，手指按住多久才放开都吞得住。
+   */
+  isPieMenuOpen: () => boolean = (): boolean => false;
 }
 
 export class FeaturePickController {
@@ -122,35 +139,82 @@ export class FeaturePickController {
     // [MeasProbe] ArkTS 实收到回传单击（若之前 native 已 fire/enqueue 而此处无日志，
     // 说明 tsfn 已回但 JS 回调丢失）；坐标应为 px（与视口 px 同量级）
     AppLog.i(`[MeasProbe] onMapTap 收到回传 (${x.toFixed(1)},${y.toFixed(1)})`);
+    // 圆菜单还浮着 → 这次单击不算地图点击：长按抬手补发的那次正是这一路（native 不否决、也不管放了多久），
+    // 菜单浮着时地图本就不该响应单击，故不限时、不限距，慢放开同样吞掉。
+    if (this.router.isPieMenuOpen()) {
+      AppLog.i(`${TAG} 圆菜单浮层未收起，忽略本次单击 (${x.toFixed(1)},${y.toFixed(1)})`);
+      return;
+    }
     // 测量采集模式：拦截点击用于加点（优先于拾取）
     if (this.measureController.handleTap(x, y)) {
       return;
     }
+    this.dispatchPick(x, y);
+  }
+
+  /**
+   * 圆菜单「编辑」：对长按落点重新拾取一次，走与单击完全一致的分流。
+   * 不经 onMapTap 的菜单浮层判定与 handleTap——那是「补发单击」与「采集加点」的语义，菜单点击不该沾边。
+   */
+  editHitAt(x: number, y: number): void {
+    if (!this.dispatchPick(x, y)) {
+      AppLog.i(`${TAG} 菜单编辑落点未命中要素 (${x.toFixed(1)},${y.toFixed(1)})`);
+    }
+  }
+
+  /**
+   * 命中分流（拾取的主体，不含菜单浮层判定与测量采集拦截）：
+   * 叠加命中 → 按类别路由；文件矢量命中 → 选中高亮 + 详情；未命中 → 取消选中。
+   * @returns 是否命中并打开了某个详情/编辑入口
+   */
+  private dispatchPick(x: number, y: number): boolean {
     const hit = this.view.pickVector(x, y);
     if (hit === undefined) {
       // 点击空白：取消要素选中高亮
       this.clearSelectedHighlight();
-      return;
+      return false;
     }
     const layerIndex: number = hit.layerIndex;
     const fid: number = hit.fid;
     // 业务叠加命中（测量/轨迹/拍照/样地/查询高亮/选中高亮）：分流并消费点击
     if (this.handleOverlayHit(layerIndex, fid)) {
-      return;
+      return true;
     }
     // 文件矢量命中：画黄色选中高亮 + 按 FID 回取属性并弹详情层
     const info: LayerInfo | undefined = this.layerManager.layerInfoByIndex(layerIndex);
     if (info === undefined) {
       // 异常态：native 回了层号但上层未登记（层表与 native 层序失同步），点击被静默吞掉
       AppLog.w(`${TAG} 命中未登记图层 index=${layerIndex} fid=${fid}，忽略本次拾取`);
-      return;
+      return false;
     }
     const path: string = info.path ?? '';
     if (path.length === 0) {
-      return;
+      return false;
     }
     this.highlightSelectedFeature(layerIndex, fid, path);
     this.showVectorFeatureDetail(path, fid);
+    return true;
+  }
+
+  /**
+   * 长按地图弹圆菜单：空白与命中要素都弹（宿主按 hasFeature 决定是否加「编辑」项）。
+   * 命中判定只做有没有，不在这里分流——分流等用户真点「编辑」时才按同一坐标重跑，
+   * 免得长按还没松手就抢在菜单前面弹出详情。
+   * 测量采集中整体不响应：用户瞄点常按得久，抬手那次单击须照旧加测点。
+   * 这里不再登记任何「抑制窗口」：菜单一浮起来，抬手补发的那次单击就由 onMapTap 的浮层判定吃掉，按住多久都一样。
+   */
+  onMapLongPress(x: number, y: number): void {
+    if (this.measureController.capturing()) {
+      return;
+    }
+    const hasFeature: boolean = this.view.pickVector(x, y) !== undefined;
+    const geo = this.view.screenToGeo(x, y);
+    if (geo === undefined) {
+      Ui.toast('该点未命中地表，请长按地图区域');
+      return;
+    }
+    AppLog.i(`${TAG} 长按弹菜单 hasFeature=${hasFeature} (${x.toFixed(1)},${y.toFixed(1)})`);
+    this.router.onDropPoint(geo.latitude, geo.longitude, x, y, hasFeature);
   }
 
   /**

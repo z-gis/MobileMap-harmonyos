@@ -19,6 +19,9 @@ export class VectorFormats {
     'geojson', 'json'];
   /** 栅格页签导入筛选 */
   static readonly RASTER_EXTS: string[] = ['tif', 'tiff', 'img'];
+  /** 同名前缀附属文件（选 shp 时一并勾选，或压缩包内自带）；与 entry_pc DeskFormats 同口径 */
+  static readonly SIDE_CAR_EXTS: string[] = ['dbf', 'shx', 'prj', 'cpg', 'sbn', 'sbx', 'qix',
+    'xml', 'tfw', 'ovr', 'aux.xml', 'hdr'];
   /** 压缩包（导入时先解压再找主文件） */
   static readonly ARCHIVE_EXTS: string[] = ['zip', 'kmz'];
   /** 属性可写回源文件的格式 */
@@ -66,7 +69,9 @@ export class VectorFormats {
 
   /** 由类型标记导出导入筛选扩展名（页签 → 文件选择器 filter） */
   static pickFilter(type: string): string[] {
-    return type === LayerType.RASTER ? VectorFormats.RASTER_EXTS.slice() : VectorFormats.VECTOR_EXTS.slice();
+    // 选择器必须放行伴随文件，否则 shp 族在系统选择器里根本选不中（只剩孤 .shp，GDAL 缺 shx 打开即失败）
+    const base: string[] = type === LayerType.RASTER ? VectorFormats.RASTER_EXTS : VectorFormats.VECTOR_EXTS;
+    return base.concat(VectorFormats.SIDE_CAR_EXTS);
   }
 
   /** 扩展名 → 中文格式名（图层列表副标题） */

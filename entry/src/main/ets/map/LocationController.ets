@@ -35,8 +35,12 @@ export class LocationController {
   onLocationText: (text: string) => void = (): void => {};
   /** 跟随锁定态变化（宿主切换定位按钮图标） */
   onFollowChanged: (enabled: boolean) => void = (): void => {};
-  /** 定位更新时的轨迹追加回调；由宿主接线到 TrackController.onLocation */
-  onTrackLocation: (lat: number, lon: number, alt: number) => void = (): void => {};
+  /**
+   * 定位更新时的轨迹追加回调；由宿主接线到 TrackController.onLocation。
+   * 传整条 [LocationPoint] 而非只传经纬度（对齐 Android LocationFollowController.onTrackLocation）：
+   * 轨迹侧要按 sourceType/accuracy/时间戳做采集门控（见 location/TrackPointGate），只给 lat/lon 就没有判据可用。
+   */
+  onTrackLocation: (location: LocationPoint) => void = (location: LocationPoint): void => {};
 
   /** 监听器引用：off 时须传同一引用 */
   private readonly listener: (location: LocationPoint) => void =
@@ -92,8 +96,8 @@ export class LocationController {
       this.navigator.moveToLocation(location.latitude, location.longitude);
     }
 
-    // 轨迹采集：记录中且未暂停时把定位点追加为活动轨迹点
-    this.onTrackLocation(location.latitude, location.longitude, location.altitude);
+    // 轨迹采集：记录中且未暂停时把整条定位交给轨迹侧门控后追加（蓝点/文本/相机跟随仍吃全部来源）
+    this.onTrackLocation(location);
   }
 
   /**
