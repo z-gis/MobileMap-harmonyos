@@ -1,11 +1,22 @@
 # MobileMap-harmonyos（调查宝 · HarmonyOS 版）
 
-调查宝（MobileMap 0.4.2.0）的 **HarmonyOS NEXT** 移植工程：面向野外调查/测绘场景的离线地图与矢量数据应用，集成自研地图渲染内核，以 ohpm 公开发布包 [`@zys/globecore`](https://ohpm.openharmony.cn/ohpm/@zys/globecore) 形式消费（ArkTS 门面 + NAPI + 共享 C++ 引擎，静态链接 GDAL/PROJ/libcurl 等，预打包 `libglobecore.so`）。
+调查宝（MobileMap 0.4.3.0）的 **HarmonyOS NEXT** 移植工程：面向野外调查/测绘场景的离线地图与矢量数据应用，集成自研地图渲染内核，以 ohpm 公开发布包 [`@zys/globecore`](https://ohpm.openharmony.cn/ohpm/@zys/globecore) 形式消费（ArkTS 门面 + NAPI + 共享 C++ 引擎，静态链接 GDAL/PROJ/libcurl/GEOS 等，预打包 `libglobecore.so`）。
 
 - **包名**：`com.zys.MobileMap`
 - **应用名**：调查宝
-- **版本**：`0.4.2.0`（versionCode `26111202`，与 Android MobileMap 对齐，同一份 `update.json` 可跨端比较）
+- **版本**：`0.4.3.0`（versionCode `26111901`，与 Android MobileMap 对齐，同一份 `update.json` 可跨端比较）
 - **runtimeOS**：HarmonyOS ｜ targetSdk `26.0.0` ｜ compatibleSdk `5.0.0(12)`
+
+## 0.4.3.0 版本要点
+
+渲染内核 `@zys/globecore` 0.1.5 → **0.1.6**（GEOS 几何编辑、KML 标注/图标口径、PNG 解码、图层级元数据）。与 Android 端同口径落地：
+
+- **几何编辑**：`GeomEditController` 长按命中 gdb/shp 要素进入编辑态（分割/删除/合并/退出），线/点层仅删除；分割=画折线切面（最大块留原 FID），合并=点选同层另一面并入（保留当前 FID 与属性）；引擎首次几何写前整份自动备份，备份失败拒绝写。HUD 与采集态门控对齐 Android（[../doc/几何编辑功能方案_20261118.md](../doc/几何编辑功能方案_20261118.md)）。
+- **移除图层可选删文件**：`RemoveLayerDialog` + `LayerFileDeleter`，勾选默认关；shp 删附属族/导入目录、gdb 独占整删、压缩包连原包清理，共享数据源（同 gdb/gpkg/压缩包）隐藏选项不误删；projects gpkg 绝不删目录。
+- **KML 标注默认显示 + 属性表还原**：标注按源 LabelStyle（scale=0 才隐藏）；导出件 description 的 HTML 嵌套表还原成成对字段行（GDAL 恒给的 7 个 KML 样板字段不作门禁）；非 kml 的 description 列当普通字段。
+- **样式预览统一**：`LayerStylePreview` 点层画真图标＋标注叠画；KML 按点/线/面分节（层声明几何类型不可信→采样判定，空层名并集扫子层）。
+- **图层元数据缓存**：`VectorMetaCache` 承接引擎 `vectorLayerMeta`（几何类型/要素数/四至），冷启动免重开文件。
+- **导入交互**（0.4.2.0 引入、本版沿用）：目录授权 + 应用内列主文件 + 同名冲突重导入/重命名。
 
 ## 0.4.2.0 版本要点
 
@@ -29,9 +40,9 @@
 | `@zys/globecore` | ohpm 依赖（预编译 HAR） | 地图渲染内核：ArkTS 门面 + NAPI 桥 + 预编译 `libglobecore.so`（arm64-v8a / x86_64），由 GlobeCore 引擎仓打包发布 |
 | `AppScope` | — | 应用级配置与资源（包名、版本、图标、应用名） |
 
-地图渲染内核已发布为 ohpm 包 **`@zys/globecore`**，本工程以**预编译 HAR** 方式消费（`entry` 依赖 `"@zys/globecore": "0.1.5"`，import 路径统一为 `'@zys/globecore'`），构建时直接使用其中打包好的 ArkTS 门面与 `libglobecore.so`，不再从本仓源码编译原生引擎。
+地图渲染内核已发布为 ohpm 包 **`@zys/globecore`**，本工程以**预编译 HAR** 方式消费（`entry`/`entry_pc` 依赖 `"@zys/globecore"`，import 路径统一为 `'@zys/globecore'`），构建时直接使用其中打包好的 ArkTS 门面与 `libglobecore.so`，不再从本仓源码编译原生引擎。
 
-> 当前 `entry/oh-package.json5` 里按版本引用的一行处于注释状态、启用的是指向 GlobeCore 仓本地产物的 `file:` 一行——ohpm 仓实际发布到 `0.1.4`，`0.1.5` 待发版；发版后把两行对调即可。
+> 当前 `entry/oh-package.json5` 与 `entry_pc/oh-package.json5` 里按版本引用的一行处于注释状态、启用的是指向 GlobeCore 仓本地产物的 `file:` 一行（`@zys-globecore-0.1.6.har`）——ohpm 仓实际发布到 `0.1.4`，`0.1.6` 待发版；发版后把两行对调即可。**file: HAR 文件名/内容变更后必须 Sync / ohpm install 重新解析缓存**，否则 hap 会吃旧 so。
 
 ### 功能页面（entry）
 `Index`（地图主界面）、`LayerManagePage`、`AddLayerPage`、`SettingsPage`、`AboutPage`、`HelpPage`、`TrackPage`、`PhotoPage`、`PhotoViewerPage`、`FeatureDetailPage`、`SurveyListPage`、`SurveyEditPage`、`AppSourcePage`。
