@@ -28,6 +28,8 @@ export class SqlQueryController {
   private queryOverlayIndices: number[] = [];
   /** 当前查询的源文件路径：高亮层命中时点击穿透回源要素、按 FID 回取属性用 */
   private queryPath: string | undefined = undefined;
+  /** 当前查询的源要素类名（GDB 同数据集多图层时用于精确定位） */
+  private queryLayerName: string = '';
 
   onResult: QueryResultListener | undefined = undefined;
 
@@ -51,10 +53,11 @@ export class SqlQueryController {
    * 并缩放到结果四至；语句错误按 GDAL/OGR 原因长时提示。
    * GDAL 打开为同步 native 调用（大文件可能秒级），故先出提示再经 setTimeout 让出一帧执行。
    */
-  runQuery(path: string, sql: string): void {
+  runQuery(path: string, sql: string, layerName: string = ''): void {
     Ui.toast('正在执行查询…');
     setTimeout((): void => {
       try {
+        this.queryLayerName = layerName;
         this.runImpl(path, sql);
       } catch (e) {
         AppLog.e('SQL 查询异常', e);
@@ -106,6 +109,7 @@ export class SqlQueryController {
     this.queryOverlayIndices = [];
     this.queryHighlight = null;
     this.queryPath = undefined;
+    this.queryLayerName = '';
   }
 
   /**
@@ -267,6 +271,11 @@ export class SqlQueryController {
   /** 查询高亮层命中时回源文件路径（供拾取穿透弹源要素只读详情）；非查询高亮层命中返回 undefined */
   sourcePathIfHit(layerIndex: number): string | undefined {
     return this.queryOverlayIndices.indexOf(layerIndex) >= 0 ? this.queryPath : undefined;
+  }
+
+  /** 查询高亮层命中时回源要素类名（无则空串）；与 sourcePathIfHit 配套 */
+  sourceLayerIfHit(layerIndex: number): string {
+    return this.queryOverlayIndices.indexOf(layerIndex) >= 0 ? this.queryLayerName : '';
   }
 
   /** 高亮样式：洋红；面额外带半透明填充，线/点仅描边色 */

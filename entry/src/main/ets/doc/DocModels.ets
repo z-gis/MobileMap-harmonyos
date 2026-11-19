@@ -29,11 +29,20 @@ export interface LayerInfoJson {
   path?: string;
   visible?: boolean;
   type?: string;
+  layerName?: string;
   styleVersion?: number;
   autoMinDisplayLevel?: number;
   userMinDisplayLevel?: number;
   vectorStyle?: StyleOverrideJson;
   groupId?: number;
+  /** 元数据缓存（P1，全部可选，旧文档缺字段行为不变）：几何类型 app 口径 0 点/1 线/2 面 */
+  geomType?: number;
+  /** 数据全量要素总数（-1/缺省 = 未知） */
+  featureCount?: number;
+  /** 数据全量 WGS84 四至 [minLon,minLat,maxLon,maxLat] */
+  extent?: number[];
+  /** 元数据指纹：写缓存时源文件修改时间（gdb 扫内层最大、shp 附属族最大） */
+  metaMtime?: number;
 }
 
 /** 图层分组（与 Android LayerGroup 字段一致）：只存 id/name，组可见性由成员 visible 派生 */
@@ -280,6 +289,8 @@ export class LayerInfo {
   path: string | undefined = undefined;
   visible: boolean = true;
   type: string | undefined = undefined;
+  /** 数据集内 OGR 图层名（GDB 要素类等）；空串保持旧版默认图层行为 */
+  layerName: string = '';
   vectorStyle: StyleOverride | undefined = undefined;
   /** 所属分组 id；-1 = 未分组。组纯组织管理，不影响压盖顺序 */
   groupId: number = LayerInfo.UNGROUPED_ID;
@@ -290,12 +301,26 @@ export class LayerInfo {
   /** 级别可见性——用户值（-1 表示未指定，此时生效自动值） */
   userMinDisplayLevel: number = LayerInfo.UNSET_LEVEL;
 
+  // ── 元数据缓存（P1，全部可选；旧文档缺字段行为与现在完全一致）──
+  // 由 native 读取链顺手产出的全量值写回（见 vector/VectorMetaCache），以 metaMtime 指纹判新鲜度：
+  // 冷启动/图层管理逐行回显不再为元数据另开 GDAL；源文件被外部修改（指纹变）自动失效回落直读。
+
+  /** 几何类型（app 口径：0 点 / 1 线 / 2 面 / -1 未知或混合）；KML/KMZ 不缓存（走 geomMaskOf 采样） */
+  geomType: number = -1;
+  /** 数据全量要素总数；-1 = 未知（不以屏幕过滤子集冒充） */
+  featureCount: number = -1;
+  /** 数据全量 WGS84 四至 [minLon,minLat,maxLon,maxLat]；undefined = 未知 */
+  extent: number[] | undefined = undefined;
+  /** 元数据指纹：写入缓存时源文件修改时间；0 = 无指纹（永不信缓存） */
+  metaMtime: number = 0;
+
   constructor(name: string | undefined = undefined, path: string | undefined = undefined,
-    type: string | undefined = undefined, visible: boolean = true) {
+    type: string | undefined = undefined, visible: boolean = true, layerName: string = '') {
     this.name = name;
     this.path = path;
     this.type = type;
     this.visible = visible;
+    this.layerName = layerName;
   }
 
   /** 级别可见性生效值：用户指定（≥0）优先，否则自动值；两者皆 <0 表示不限制 */
@@ -330,6 +355,9 @@ export class LayerInfo {
       visible: this.visible,
       type: this.type,
     };
+    if (this.layerName.length > 0) {
+      o.layerName = this.layerName;
+    }
     if (this.styleVersion !== 0) {
       o.styleVersion = this.styleVersion;
     }
@@ -342,6 +370,18 @@ export class LayerInfo {
     if (this.groupId !== LayerInfo.UNGROUPED_ID) {
       o.groupId = this.groupId;
     }
+    if (this.geomType >= 0) {
+      o.geomType = this.geomType;
+    }
+    if (this.featureCount >= 0) {
+      o.featureCount = this.featureCount;
+    }
+    if (this.extent !== undefined && this.extent.length === 4) {
+      o.extent = this.extent;
+    }
+    if (this.metaMtime !== 0) {
+      o.metaMtime = this.metaMtime;
+    }
     const style: StyleOverride | undefined = this.vectorStyle;
     if (style !== undefined && !style.isEmpty()) {
       o.vectorStyle = style.toJson();
@@ -350,11 +390,27 @@ export class LayerInfo {
   }
 
   static fromJson(o: LayerInfoJson): LayerInfo {
-    const l: LayerInfo = new LayerInfo(o.name, o.path, o.type, o.visible ?? true);
+    const l: LayerInfo = new LayerInfo(o.name, o.path, o.type, o.visible ?? true, o.layerName ?? '');
     l.styleVersion = o.styleVersion ?? 0;
     l.autoMinDisplayLevel = o.autoMinDisplayLevel ?? LayerInfo.UNSET_LEVEL;
     l.userMinDisplayLevel = o.userMinDisplayLevel ?? LayerInfo.UNSET_LEVEL;
     l.groupId = o.groupId ?? LayerInfo.UNGROUPED_ID;
+    // 元数据缓存：宽松读取，旧文档无这些字段时保持「未知」默认（行为与现在完全一致）
+    l.geomType = o.geomType ?? -1;
+    l.featureCount = o.featureCount ?? -1;
+    if (o.extent !== undefined && o.extent.length === 4) {
+      const e: number[] = o.extent;
+      let finite: boolean = true;
+      for (let i = 0; i < 4; i++) {
+        if (!Number.isFinite(e[i])) {
+          finite = false;
+        }
+      }
+      if (finite) {
+        l.extent = [e[0], e[1], e[2], e[3]];
+      }
+    }
+    l.metaMtime = o.metaMtime ?? 0;
     if (o.vectorStyle !== undefined) {
       l.vectorStyle = StyleOverride.fromJson(o.vectorStyle);
     }
@@ -444,8 +500,8 @@ export class SystemConfig {
   showMeasureLayer: boolean = true;
   /** false = 十进制度；true = 米（CGCS2000 3 度带，带号按经度自动选取） */
   coordDisplayMeter: boolean = false;
-  /** KML/KMZ 名称标注显示开关（默认关，地图更清爽） */
-  showKmlLabel: boolean = false;
+  /** KML/KMZ 名称标注显示开关（默认开，标注字段默认 Name；已纳入 KML 图层缓存键，切换即时就地换层） */
+  showKmlLabel: boolean = true;
   /**
    * 3D 视图（球模式）：false = 2D 墨卡托（默认），true = 3D。
    * 原由主界面左上按键切换并随相机独立持久化；0.3.0.1 起改由设置页控制、随系统配置持久化，
@@ -488,7 +544,7 @@ export class SystemConfig {
     c.showTrackLayer = o.showTrackLayer ?? true;
     c.showMeasureLayer = o.showMeasureLayer ?? true;
     c.coordDisplayMeter = o.coordDisplayMeter ?? false;
-    c.showKmlLabel = o.showKmlLabel ?? false;
+    c.showKmlLabel = o.showKmlLabel ?? true;
     c.viewMode3d = o.viewMode3d ?? false;
     c.rasterTileCacheEnabled = o.rasterTileCacheEnabled ?? true;
     c.tileOfflineOnly = o.tileOfflineOnly ?? false;
@@ -549,8 +605,10 @@ export class MapDocument {
     return this.mapSources.find((s: MapSource) => s.name === name);
   }
 
-  findVectorLayer(path: string): LayerInfo | undefined {
-    return this.vectorLayers.find((l: LayerInfo) => l.path === path);
+  /** 按路径查找矢量图层；layerName 非空时须同时匹配要素类名（GDB 同数据集多图层） */
+  findVectorLayer(path: string, layerName: string = ''): LayerInfo | undefined {
+    return this.vectorLayers.find((l: LayerInfo) =>
+      l.path === path && (layerName.length === 0 || l.layerName === layerName));
   }
 
   toJson(): MapDocumentJson {

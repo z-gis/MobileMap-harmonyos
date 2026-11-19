@@ -13,7 +13,7 @@ import { AppLog } from '../common/AppLog';
 import { CoordFormatter } from '../common/Coord';
 import { MercatorZoom } from '../common/MercatorZoom';
 import { Prefs } from '../common/Prefs';
-import { GdalVectorReader } from '../vector/GdalVectorReader';
+import { VectorMetaCache } from '../vector/VectorMetaCache';
 
 const TAG: string = 'CameraNavigator';
 
@@ -194,10 +194,9 @@ export class CameraNavigator {
     this.updateStatusText();
   }
 
-  /** 缩放到图层四至（GDAL 读取，kmz 走 /vsizip/ 虚拟文件）；读不到范围则不动作 */
-  zoomToLayerExtent(path: string): void {
-    const openPath: string = path.toLowerCase().endsWith('.kmz') ? `/vsizip/${path}` : path;
-    const extent: number[] | null = GdalVectorReader.layerExtent(openPath);
+  /** 缩放到图层四至：优先文档元数据缓存（指纹新鲜免开 GDAL），未命中回落直读（kmz 走 /vsizip/）；读不到则不动作 */
+  zoomToLayerExtent(path: string, layerName: string = ''): void {
+    const extent: number[] | null = VectorMetaCache.extentOfPath(path, layerName);
     if (extent !== null && extent.length === 4) {
       this.zoomToExtent(extent[0], extent[1], extent[2], extent[3]);
     } else {

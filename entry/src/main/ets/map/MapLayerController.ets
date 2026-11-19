@@ -8,7 +8,7 @@
 //  · 懒加入：不可见层不下发 native，避免无谓的 GDAL 读取与加载胶囊误亮，首次转可见时再补加入。
 // 依赖单向：构造注入内核视图引用，非结构变化时的就地同步在此完成，需重建时返回 true 交宿主。
 
-import { NativeMapView, VectorExtent } from '@zys/globecore';
+import { NativeMapView, VectorExtent, VectorLayerMeta } from '@zys/globecore';
 import { AppDirs } from '../common/AppDirs';
 import { AppLog } from '../common/AppLog';
 import { ColorHex } from '../common/ColorHex';
@@ -17,8 +17,8 @@ import { StyleOverride, LayerInfo, MapDocument, MapSource } from '../doc/DocMode
 import { DocumentManager } from '../doc/DocumentManager';
 import { TileCacheMigration } from './TileCacheMigration';
 import { FeatureIcons } from '../vector/FeatureIcons';
-import { GdalVectorReader } from '../vector/GdalVectorReader';
 import { VectorFormats, VectorReloadConfig } from '../vector/VectorFormats';
+import { VectorMetaCache } from '../vector/VectorMetaCache';
 
 const TAG: string = 'MapLayerController';
 
@@ -32,6 +32,9 @@ const EXTENT_CHANGE_RATIO: number = 0.1;
 const VECTOR_LOADING_SHOW_DELAY_MS: number = 500;
 /** 提示显示后的状态轮询间隔 */
 const VECTOR_LOADING_POLL_MS: number = 250;
+/** 元数据收口轮询上限（× VECTOR_LOADING_POLL_MS = 15s）：几何迟迟未被 GL 线程接管则放弃本轮，
+ * 下次加载/重载重新排队；不影响渲染，只影响 document.json 缓存何时写上。 */
+const META_HARVEST_MAX_ATTEMPTS: number = 60;
 
 export class MapLayerController {
   private readonly view: NativeMapView;
@@ -73,6 +76,9 @@ export class MapLayerController {
 
   private showTimer: number = -1;
   private pollTimer: number = -1;
+  /** 元数据收口定时器（独立于加载胶囊：胶囊未接线/快速加载也要收口） */
+  private metaTimer: number = -1;
+  private metaAttempts: number = 0;
 
   constructor(view: NativeMapView) {
     this.view = view;
@@ -83,6 +89,7 @@ export class MapLayerController {
   /** 宿主销毁时取消一切挂起任务，避免定时器回调触碰已销毁组件 */
   dispose(): void {
     this.cancelLoadingTimers();
+    this.cancelMetaHarvest();
   }
 
   /**
@@ -276,7 +283,7 @@ export class MapLayerController {
         this.vectorLayerIndices.set(key, idx);
       }
     }
-    // 显隐 + 级别下限同步（图层管理对话框改级别后即时生效）
+    // 显隐 + 级别下限 + 压盖序同步（图层管理对话框改级别/拖动排序后即时生效）
     for (let i = 0; i < infos.length; i++) {
       const info: LayerInfo = infos[i];
       const path: string = info.path ?? '';
@@ -289,8 +296,41 @@ export class MapLayerController {
       }
       this.view.setVectorLayerVisible(idx, info.visible);
       this.view.setVectorMinLevel(idx, Math.max(0, info.effectiveMinDisplayLevel()));
+      // 压盖序真源 = doc 数组位置（数组首=最下层，UI 倒序显示故「列表顶=最上层」）；
+      // 全量幂等下发：新懒加入层同循环拿到初始 order，不再默认追加到最顶
+      this.view.setVectorLayerOrder(idx, i);
     }
     this.builtVectorSignature = MapLayerController.vectorSignature(doc);
+  }
+
+  /**
+   * 几何编辑后就地重载指定矢量层（gdb/shp 源文件已被 native 改写，native 缓存几何失效）：
+   * 墓碑旧层并清其派生状态（含数据四至缓存——合并/分割可能改变四至），再走懒加入重建。
+   * 不改文档、不触发文档监听（样式未变，纯数据刷新）。
+   */
+  reloadVectorLayer(path: string, layerName: string = ''): void {
+    const doc: MapDocument | null = DocumentManager.getInstance().getDocument();
+    if (doc === null || path.length === 0) {
+      return;
+    }
+    for (let i = 0; i < doc.vectorLayers.length; i++) {
+      const info: LayerInfo = doc.vectorLayers[i];
+      if (info.path !== path || info.layerName !== layerName) {
+        continue;
+      }
+      const key: string = MapLayerController.vectorKey(info);
+      const idx: number | undefined = this.vectorLayerIndices.get(key);
+      if (idx !== undefined) {
+        AppLog.i(`几何编辑后就地换层: ${key} -> removeVectorLayer(${idx})`);
+        this.view.removeVectorLayer(idx);
+      }
+      this.vectorLayerIndices.delete(key);
+      this.directVectorKeys.delete(key);
+      this.lastExtentByKey.delete(key);
+      this.pendingViewportKeys.delete(key);
+      this.dataExtentByKey.delete(key);
+    }
+    this.syncVectorLayers(doc);
   }
 
   /**
@@ -417,6 +457,7 @@ export class MapLayerController {
    * 显示后按 VECTOR_LOADING_POLL_MS 轮询至完成收起。幂等可重复调用。
    */
   notifyVectorLoadStarted(): void {
+    this.scheduleMetaHarvest();
     if (this.onVectorLoadingChange === undefined) {
       return;
     }
@@ -442,6 +483,79 @@ export class MapLayerController {
     }, VECTOR_LOADING_SHOW_DELAY_MS);
   }
 
+  // ── 元数据收口（P1）：加载完成后把 native 读取链的全量元数据写回文档缓存，冷启动免另开 GDAL ──
+
+  /** 排一次元数据收口（幂等：重复调用只保留一个在队任务），加载启动即调 */
+  private scheduleMetaHarvest(): void {
+    this.cancelMetaHarvest();
+    this.metaTimer = setTimeout((): void => {
+      this.metaHarvestTick();
+    }, VECTOR_LOADING_POLL_MS);
+  }
+
+  private metaHarvestTick(): void {
+    this.metaTimer = -1;
+    const pending: boolean = this.harvestVectorMeta();
+    if (pending && this.metaAttempts < META_HARVEST_MAX_ATTEMPTS) {
+      this.metaAttempts++;
+      this.metaTimer = setTimeout((): void => {
+        this.metaHarvestTick();
+      }, VECTOR_LOADING_POLL_MS);
+    } else {
+      this.metaAttempts = 0;
+    }
+  }
+
+  private cancelMetaHarvest(): void {
+    if (this.metaTimer >= 0) {
+      clearTimeout(this.metaTimer);
+      this.metaTimer = -1;
+    }
+    this.metaAttempts = 0;
+  }
+
+  /**
+   * 收口一轮：逐已加入层取内核 vectorLayerMeta，已知项写回 LayerInfo（指纹=源文件 mtime），
+   * 有变化才 save 一次（save 广播回来的 sync 键集合不变 → 不重建、不再写，幂等收敛）。
+   * 返回是否仍有层未就绪（需再轮询）；未加入的层跳过，待其懒加入后由下一轮收口。
+   */
+  private harvestVectorMeta(): boolean {
+    const doc: MapDocument | null = DocumentManager.getInstance().getDocument();
+    if (doc === null) {
+      return false;
+    }
+    if (!this.view.isNativeReady()) {
+      return true;
+    }
+    let changed: boolean = false;
+    let pending: boolean = false;
+    const layers: LayerInfo[] = doc.vectorLayers;
+    for (let i = 0; i < layers.length; i++) {
+      const info: LayerInfo = layers[i];
+      const path: string = info.path ?? '';
+      if (path.length === 0) {
+        continue;
+      }
+      const idx: number | undefined = this.vectorLayerIndices.get(MapLayerController.vectorKey(info));
+      if (idx === undefined) {
+        continue;
+      }
+      const meta: VectorLayerMeta | undefined = this.view.vectorLayerMeta(idx);
+      if (meta === undefined) {
+        pending = true;
+        continue;
+      }
+      if (VectorMetaCache.applyMeta(info, meta, VectorMetaCache.sourceMtime(path))) {
+        changed = true;
+      }
+    }
+    if (changed) {
+      AppLog.i('矢量元数据写回文档缓存（geomType/featureCount/extent + mtime 指纹）');
+      DocumentManager.getInstance().save();
+    }
+    return pending;
+  }
+
   /**
    * 加入一个矢量图层到 native：文档样式覆盖映射为内核渲染参数 + 点图标位图 + 大小数据分流。
    * 返回 native 索引（<0 失败 / 挂起）。
@@ -450,13 +564,26 @@ export class MapLayerController {
     const override: StyleOverride | undefined = info.vectorStyle;
     const effective: StyleOverride | undefined =
       (override !== undefined && !override.isEmpty()) ? override : undefined;
-    // 标注门控：KML/KMZ 额外受 showKmlLabel 开关控制（复刻 Android suppressLabels 口径）
+    // 标注门控：KML/KMZ 额外受 showKmlLabel 开关控制；开关开且未设标注字段时默认取 Name
+    // （Placemark 名称；KML 标注设置不在图层弹窗开放，标注随源文件）。与 Android 同口径。
     const doc: MapDocument | null = DocumentManager.getInstance().getDocument();
-    const showKmlLabel: boolean = doc === null ? false : doc.systemConfig.showKmlLabel;
-    const suppressLabel: boolean = VectorFormats.isKml(path) && !showKmlLabel;
-    const labelField: string = suppressLabel ? '' : ((effective !== undefined
-      && effective.labelField !== undefined ? effective.labelField.trim() : ''));
+    const showKmlLabel: boolean = doc === null ? true : doc.systemConfig.showKmlLabel;
+    const isKml: boolean = VectorFormats.isKml(path);
+    const suppressLabel: boolean = isKml && !showKmlLabel;
+    const userLabelField: string = (effective !== undefined
+      && effective.labelField !== undefined) ? effective.labelField.trim() : '';
+    const labelField: string = suppressLabel ? '' :
+      (isKml ? (userLabelField.length > 0 ? userLabelField : 'Name') : userLabelField);
     const style = MapStyle.toVectorStyle(effective, labelField);
+    // KML 默认开白色掩膜（源文件无掩膜通道，app 侧默认口径，与 Android 同）；用户显式设过则尊重
+    if (isKml) {
+      if (effective === undefined || effective.labelOutline === undefined) {
+        style.labelOutline = true;
+      }
+      if (effective === undefined || effective.labelOutlineColor === undefined) {
+        style.labelOutlineColor = 0xFFFFFFFF;
+      }
+    }
     // 单要素样式覆盖：fid → 8 字段串，与整层样式同源下传（空串 = 无覆盖，零回归）
     style.featureStyleOverride = this.buildFeatureStyleOverride(effective);
 
@@ -467,9 +594,10 @@ export class MapLayerController {
           ? effective.outlineColor : MapStyle.argbToHex(MapStyle.DEFAULT_LINE_COLOR),
         1, true));
 
-    // 大小数据分流：< DIRECT_RENDER_LIMIT 走整文件全量（不参与相机重载）；否则按屏幕范围相交加载
+    // 大小数据分流：要素总数优先取文档元数据缓存（指纹新鲜即免开 GDAL），未命中回落快速统计；
+    // < DIRECT_RENDER_LIMIT 走整文件全量（不参与相机重载）；否则按屏幕范围相交加载
     const key: string = MapLayerController.vectorKey(info);
-    const count: number = GdalVectorReader.countFeatures(path);
+    const count: number = VectorMetaCache.featureCountOf(info);
     const direct: boolean = count < 0 || count < DIRECT_RENDER_LIMIT;
     let extent: VectorExtent | undefined = undefined;
     if (!direct && this.extentProvider !== undefined) {
@@ -477,7 +605,7 @@ export class MapLayerController {
     }
     // 屏外预判：大数据层四至与屏幕范围确定不相交 → 挂起（免无谓 GDAL 读取与胶囊误亮）
     if (!direct && extent !== undefined) {
-      const bbox: VectorExtent | undefined = this.dataExtentOf(key, path);
+      const bbox: VectorExtent | undefined = this.dataExtentOf(key, path, info.layerName);
       if (bbox !== undefined && !MapLayerController.extentIntersects(bbox, extent)) {
         this.pendingViewportKeys.add(key);
         AppLog.i(`矢量层[${info.displayName()}]四至与屏幕范围不相交，挂起待进入视口再加入`);
@@ -489,7 +617,7 @@ export class MapLayerController {
     // 固定 64×64，故传 FeatureIcons.SIZE。内核按 iconW 作屏幕固定显示像素（64px≈21dp，与 Android 24dp 同级）
     const idx: number = this.view.addVectorLayer(path, style, iconArgb,
       FeatureIcons.SIZE, FeatureIcons.SIZE,
-      extent, MAX_FEATURES_BUDGET);
+      extent, MAX_FEATURES_BUDGET, info.layerName);
     if (idx >= 0) {
       this.view.setVectorMinLevel(idx, Math.max(0, info.effectiveMinDisplayLevel()));
       if (direct) {
@@ -559,13 +687,12 @@ export class MapLayerController {
     return entries.join(';');
   }
 
-  /** 图层四至缓存读取（WGS84）；未缓存则开文件取一次，失败不写缓存（下次重试） */
-  private dataExtentOf(key: string, path: string): VectorExtent | undefined {
+  /** 图层四至缓存读取（WGS84）：本层未缓存则问文档元数据缓存（指纹新鲜免开 GDAL），再回落直读；失败不写成功语义 */
+  private dataExtentOf(key: string, path: string, layerName: string = ''): VectorExtent | undefined {
     if (this.dataExtentByKey.has(key)) {
       return this.dataExtentByKey.get(key);
     }
-    const openPath: string = path.toLowerCase().endsWith('.kmz') ? `/vsizip/${path}` : path;
-    const raw: number[] | null = GdalVectorReader.layerExtent(openPath);
+    const raw: number[] | null = VectorMetaCache.extentOfPath(path, layerName);
     let ext: VectorExtent | undefined = undefined;
     if (raw !== null && raw.length >= 4) {
       ext = new VectorExtent(raw[0], raw[1], raw[2], raw[3]);
@@ -600,12 +727,12 @@ export class MapLayerController {
    * 矢量图层回显色（填充/描边 hex）：供图层管理预览与样式对话框所见即所得回显。
    * 本侧矢量层完全文档驱动（无源文件内嵌样式），故即「文档样式 ?: 默认色」。
    */
-  layerRenderColorsOf(path: string): string[] {
+  layerRenderColorsOf(path: string, layerName: string = ''): string[] {
     const doc: MapDocument | null = DocumentManager.getInstance().getDocument();
     if (doc === null) {
       return ['', ''];
     }
-    const info: LayerInfo | undefined = doc.findVectorLayer(path);
+    const info: LayerInfo | undefined = doc.findVectorLayer(path, layerName);
     if (info === undefined) {
       return ['', ''];
     }
@@ -620,8 +747,11 @@ export class MapLayerController {
       `#${ColorHex.toHex(MapStyle.DEFAULT_FILL_COLOR)}`);
     const fill: number = MapStyle.resolveFillColor(fillHex,
       effective === undefined ? undefined : effective.fillOpacity, undefined);
+    // 线图层实际渲染走线通道（默认橙），回显第二色若取面描边默认白会与地图所见不符
+    const outlineDefault: number = VectorMetaCache.geomTypeOf(info) === 1
+      ? MapStyle.DEFAULT_LINE_COLOR : MapStyle.DEFAULT_POLYGON_OUTLINE_COLOR;
     const outline: number = ColorHex.parse(
-      MapLayerController.colorOr(effective, false, ''), MapStyle.DEFAULT_POLYGON_OUTLINE_COLOR);
+      MapLayerController.colorOr(effective, false, ''), outlineDefault);
     return [MapStyle.argbToHex(fill), MapStyle.argbToHex(outline)];
   }
 
@@ -693,9 +823,17 @@ export class MapLayerController {
     return parts.join(';');
   }
 
-  /** 矢量层缓存键：路径 + 样式版本 */
+  /** 矢量层缓存键：路径 + 要素类 + 样式版本；KML/KMZ 另纳入 showKmlLabel 开关——
+   *  开关切换后旧键墓碑就地换层即时生效（与 Android vectorKey 同口径），无需重启 */
   static vectorKey(info: LayerInfo): string {
-    return `${info.path ?? ''}|${info.styleVersion}`;
+    const path: string = info.path ?? '';
+    const base: string = `${path}|${info.layerName}|${info.styleVersion}`;
+    if (!VectorFormats.isKml(path)) {
+      return base;
+    }
+    const doc: MapDocument | null = DocumentManager.getInstance().getDocument();
+    const on: boolean = doc === null ? true : doc.systemConfig.showKmlLabel;
+    return `${base}|kmlLabel=${on ? 1 : 0}`;
   }
 
   /** 两 WGS84 矩形是否相交（边界接触算相交，与内核整层跳过判定同口径） */

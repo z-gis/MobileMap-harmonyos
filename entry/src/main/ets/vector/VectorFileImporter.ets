@@ -17,36 +17,42 @@ import fs from '@ohos.file.fs';
 import uri from '@ohos.uri';
 import zlib from '@ohos.zlib';
 import { promptAction } from '@kit.ArkUI';
+import { NativeLayerInfo } from '@zys/globecore';
 import { AppDirs } from '../common/AppDirs';
 import { AppLog } from '../common/AppLog';
 import { VectorFormats } from './VectorFormats';
 
 const TAG: string = 'VectorFileImporter';
 
-/** 导入结果：加载/渲染使用的实际文件路径与显示名称 */
+/** 导入结果：加载/渲染使用的实际文件路径与显示名称；GDB 另带要素类名（path+layerName 为稳定身份） */
 export class ImportResult {
   path: string;
   name: string;
+  layerName: string;
 
-  constructor(path: string, name: string) {
+  constructor(path: string, name: string, layerName: string = '') {
     this.path = path;
     this.name = name;
+    this.layerName = layerName;
   }
 }
 
 /**
  * 导入候选：源主文件 URI + 同组附属 URI + 建议显示名（去扩展名）。
  * 规划阶段只枚举不拷贝，供宿主先判同名冲突（重新导入 / 重命名导入）再决定落盘前缀。
+ * isGdb：主数据为 .gdb 目录（整个数据集拷入沙箱，再按要素类建多个图层）。
  */
 export class ImportCandidate {
   mainUri: string;
   sideCars: string[];
   name: string;
+  isGdb: boolean;
 
-  constructor(mainUri: string, sideCars: string[], name: string) {
+  constructor(mainUri: string, sideCars: string[], name: string, isGdb: boolean = false) {
     this.mainUri = mainUri;
     this.sideCars = sideCars;
     this.name = name;
+    this.isGdb = isGdb;
   }
 }
 
@@ -174,17 +180,30 @@ export class VectorFileImporter {
       return out;
     }
     const base: uri.URI = new uri.URI(folderUri);
+    // 用户直接选中 .gdb 目录本体：把该目录本身作为唯一主数据返回（整目录导入）
+    if (!raster && VectorFileImporter.isGdbDatasetDir(folderPath)) {
+      base.path = folderPath;
+      out.push(base.toString());
+      return out;
+    }
     for (let i = 0; i < names.length; i++) {
       const n: string = names[i];
       if (n.length === 0 || n.startsWith('.')) {
         continue;
       }
       const childPath: string = `${folderPath}/${n}`;
+      let isFile: boolean = false;
       try {
-        if (!fs.statSync(childPath).isFile()) {
-          continue;
-        }
+        isFile = fs.statSync(childPath).isFile();
       } catch (e) {
+        continue;
+      }
+      if (!isFile) {
+        // GDB 是目录型数据集：仅收录确含 FileGDB 数据文件的 .gdb 目录
+        if (!raster && VectorFileImporter.isGdbDatasetDir(childPath)) {
+          base.path = childPath;
+          out.push(base.toString());
+        }
         continue;
       }
       const isMain: boolean = raster ? VectorFormats.isRaster(n) : VectorFormats.isVector(n);
@@ -205,6 +224,10 @@ export class VectorFileImporter {
    */
   static collectFolderSiblings(mainUri: string): string[] {
     const fileName: string = VectorFileImporter.fileNameOfUri(mainUri);
+    // GDB 为目录型数据集，整目录导入，不存在同前缀附属
+    if (VectorFormats.isGdb(fileName)) {
+      return [];
+    }
     const dot: number = fileName.lastIndexOf('.');
     if (dot <= 0) {
       return [];
@@ -276,7 +299,8 @@ export class VectorFileImporter {
       }
       const rest: string[] = members.filter((u: string) => u !== main);
       const name: string = AppDirs.deriveBaseName(VectorFileImporter.fileNameOfUri(main));
-      out.push(new ImportCandidate(main, rest, name));
+      const isGdb: boolean = VectorFormats.isGdb(VectorFileImporter.fileNameOfUri(main));
+      out.push(new ImportCandidate(main, rest, name, isGdb));
     }
     return out;
   }
@@ -305,6 +329,111 @@ export class VectorFileImporter {
     }
     AppLog.i(`整族拷入[${safeStem}] 主文件+${candidate.sideCars.length} 附属`);
     return new ImportResult(dest, targetStem);
+  }
+
+  /**
+   * 导入 FileGDB 数据集目录：整目录递归拷入 layer/<名>.gdb（保持内部结构），
+   * 再经 OGR 枚举要素类，每个要素类产出一个 ImportResult（path 相同、layerName 不同）。
+   * 与原 Android 一致：同名重新导入时整目录覆盖。
+   */
+  static importGdbGroup(candidate: ImportCandidate, targetStem: string): ImportResult[] {
+    const out: ImportResult[] = [];
+    let sourcePath: string = '';
+    try {
+      sourcePath = new uri.URI(candidate.mainUri).path;
+    } catch (e) {
+      AppLog.e(`GDB 目录 URI 解析失败: ${candidate.mainUri}`, e);
+      return out;
+    }
+    if (sourcePath.length === 0) {
+      return out;
+    }
+    const destDir: string = AppDirs.ensureDir(AppDirs.dir(AppDirs.LAYER));
+    const safeStem: string = AppDirs.sanitizeFileName(targetStem);
+    const dataset: string = `${destDir}/${safeStem}.gdb`;
+    if (AppDirs.exists(dataset)) {
+      VectorFileImporter.removeDir(dataset);
+    }
+    if (!VectorFileImporter.copyDirRecursive(sourcePath, dataset)) {
+      return out;
+    }
+    let layerNames: string[] = [];
+    try {
+      layerNames = NativeLayerInfo.getVectorLayerNames(dataset);
+    } catch (e) {
+      AppLog.e(`枚举 GDB 要素类失败: ${dataset}`, e);
+    }
+    if (layerNames === undefined || layerNames === null || layerNames.length === 0) {
+      AppLog.w(`GDB 未发现可导入要素类: ${dataset}`);
+      return out;
+    }
+    for (let i = 0; i < layerNames.length; i++) {
+      out.push(new ImportResult(dataset, targetStem, layerNames[i]));
+    }
+    AppLog.i(`GDB 导入[${safeStem}]：要素类 ${out.length} 个`);
+    return out;
+  }
+
+  /** 是否为含 FileGDB 数据文件的 .gdb 目录（标记文件 gdb 或 *.gdbtable），避免空目录误判 */
+  static isGdbDatasetDir(dirPath: string): boolean {
+    if (!VectorFormats.isGdb(dirPath)) {
+      return false;
+    }
+    let names: string[] = [];
+    try {
+      names = fs.listFileSync(dirPath, { recursion: false });
+    } catch (e) {
+      return false;
+    }
+    for (let i = 0; i < names.length; i++) {
+      const lower: string = names[i].toLowerCase();
+      if (lower === 'gdb' || lower.endsWith('.gdbtable')) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  /** 目录递归复制（覆盖式）；任一文件失败返回 false */
+  private static copyDirRecursive(srcDir: string, destDir: string): boolean {
+    try {
+      AppDirs.ensureDir(destDir);
+      const names: string[] = fs.listFileSync(srcDir, { recursion: false });
+      for (let i = 0; i < names.length; i++) {
+        const n: string = names[i];
+        if (n.length === 0 || n.startsWith('.')) {
+          continue;
+        }
+        const s: string = `${srcDir}/${n}`;
+        const d: string = `${destDir}/${n}`;
+        if (fs.statSync(s).isDirectory()) {
+          if (!VectorFileImporter.copyDirRecursive(s, d)) {
+            return false;
+          }
+          continue;
+        }
+        let f: fs.File | null = null;
+        try {
+          if (AppDirs.exists(d)) {
+            fs.unlinkSync(d);
+          }
+          f = fs.openSync(s, fs.OpenMode.READ_ONLY);
+          fs.copyFileSync(f.fd, d);
+        } finally {
+          if (f !== null) {
+            try {
+              fs.closeSync(f);
+            } catch (e) {
+              AppLog.w(`关闭 GDB 文件描述符异常: ${e}`);
+            }
+          }
+        }
+      }
+      return true;
+    } catch (e) {
+      AppLog.e(`GDB 目录复制失败 ${srcDir} -> ${destDir}`, e);
+      return false;
+    }
   }
 
   /** 普通数据文件：拷入 layer 目录（同名覆盖），附属文件一并拷入 */

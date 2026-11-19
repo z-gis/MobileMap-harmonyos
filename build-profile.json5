@@ -1,6 +1,20 @@
 {
   "app": {
-    "signingConfigs": [],
+    "signingConfigs": [
+      {
+        "name": "default",
+        "type": "HarmonyOS",
+        "material": {
+          "certpath": "C:\\Users\\dtalp\\.ohos\\config\\default_MobileMap-harmonyos_BeTS7KudSha76rKUYoJy9tXciTOqR-JzKCf-DSqDA20=.cer",
+          "keyAlias": "debugKey",
+          "keyPassword": "0000001BA421FC33B7A8884D6B51DFA882C7AED092F95D1CBC1E0EF6F2489552E0EF1801C9A8397F0E8E77",
+          "profile": "C:\\Users\\dtalp\\.ohos\\config\\default_MobileMap-harmonyos_BeTS7KudSha76rKUYoJy9tXciTOqR-JzKCf-DSqDA20=.p7b",
+          "signAlg": "SHA256withECDSA",
+          "storeFile": "C:\\Users\\dtalp\\.ohos\\config\\default_MobileMap-harmonyos_BeTS7KudSha76rKUYoJy9tXciTOqR-JzKCf-DSqDA20=.p12",
+          "storePassword": "0000001BD6FD3A8F55F1B31EFCF227FF66C8B81D7E81323A4F9BB73AE90ACA364A8A6E3A2698E259C539C1"
+        }
+      }
+    ],
     "products": [
       {
         "name": "default",

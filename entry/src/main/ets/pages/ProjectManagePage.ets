@@ -317,7 +317,11 @@ struct ProjectManagePage {
         hint: '选中工程的采集数据将追加到当前工程，源工程保持不变。',
         options: names,
         onPick: (index: number): void => {
+          this.optionDialog?.close();
           this.startMerge(candidates[index]);
+        },
+        onCancel: (): void => {
+          this.optionDialog?.close();
         },
       }),
       customStyle: true,

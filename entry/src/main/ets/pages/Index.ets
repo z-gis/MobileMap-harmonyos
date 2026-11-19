@@ -37,6 +37,7 @@ import { MediaPackage } from '../media/MediaPackage';
 import { BusinessOverlayManager } from '../map/BusinessOverlayManager';
 import { CameraNavigator, DEFAULT_LAT, DEFAULT_LON } from '../map/CameraNavigator';
 import { FeatureDetailRequest, FeaturePickController, PickRouter } from '../map/FeaturePickController';
+import { GeomEditController, GeomEditPhase } from '../map/GeomEditController';
 import { LocationController } from '../map/LocationController';
 import { MapLayerController } from '../map/MapLayerController';
 import { MapServices } from '../map/MapServices';
@@ -127,6 +128,11 @@ struct Index {
    */
   @State pieMenu: PieMenuSpec = new PieMenuSpec();
   @State pieMenuOpen: boolean = false;
+  /** 几何编辑态（gdb/shp 分割/删除/合并）：阶段驱动 HUD 显隐与底部工具条 */
+  @State geomPhase: GeomEditPhase = GeomEditPhase.NONE;
+  @State geomSplitPoints: number = 0;
+  @State geomIsPolygon: boolean = false;
+  @State geomFid: number = -1;
 
   // ── 地图控制器（onReady 后就位）──
   private appCtx: common.UIAbilityContext | undefined = undefined;
@@ -140,6 +146,7 @@ struct Index {
   private sql: SqlQueryController | undefined = undefined;
   private pick: FeaturePickController | undefined = undefined;
   private capture: MediaCaptureHelper | undefined = undefined;
+  private geomEdit: GeomEditController | undefined = undefined;
 
   // ── 弹层与挂起任务 ──
   private measureDialog: CustomDialogController | undefined = undefined;
@@ -215,6 +222,21 @@ struct Index {
       this.pieMenuOpen = false;
       return true;
     }
+    // 几何编辑态分级退出：画线/选靶子模式先回工具条，工具条再整体退出
+    if (this.geomPhase === GeomEditPhase.SPLIT_LINE || this.geomPhase === GeomEditPhase.MERGE_PICK) {
+      const ge: GeomEditController | undefined = this.geomEdit;
+      if (ge !== undefined) {
+        ge.cancelSubMode();
+      }
+      return true;
+    }
+    if (this.geomPhase === GeomEditPhase.EDIT) {
+      const ge: GeomEditController | undefined = this.geomEdit;
+      if (ge !== undefined) {
+        ge.exit();
+      }
+      return true;
+    }
     this.confirmExit();
     return true;
   }
@@ -257,6 +279,8 @@ struct Index {
     this.sql = undefined;
     this.pick = undefined;
     this.capture = undefined;
+    this.geomEdit = undefined;
+    this.geomPhase = GeomEditPhase.NONE;
     // 落点圆菜单是瞬态浮层：装配收尾一并收掉，别让它带着旧坐标活到下一轮
     this.pieMenuOpen = false;
     MapServices.instance.clear();
@@ -289,6 +313,13 @@ struct Index {
     const pick: FeaturePickController = new FeaturePickController(view, ctx, layers, overlays, sql,
       measure, pickRouter);
     const capture: MediaCaptureHelper = new MediaCaptureHelper(ctx);
+    const geomEdit: GeomEditController = new GeomEditController(view, ctx, layers, pick);
+    geomEdit.onStateChanged = (phase: GeomEditPhase): void => {
+      this.geomPhase = phase;
+      this.geomSplitPoints = geomEdit.pointCount();
+      this.geomIsPolygon = geomEdit.isPolygon();
+      this.geomFid = geomEdit.targetFid();
+    };
 
     // 互接线（与 Android setupMapUi 的构造后赋值一一对应）
     layers.extentProvider = (): VectorExtent | undefined => {
@@ -315,7 +346,7 @@ struct Index {
       this.compassVisible = Math.abs(deg) > HEADING_SHOW_THRESHOLD_DEG
         && view.getViewMode() === ViewMode.THREE_D;
     };
-    overlays.isCapturing = (): boolean => measure.capturing() || track.capturing();
+    overlays.isCapturing = (): boolean => measure.capturing() || track.capturing() || geomEdit.capturing();
     overlays.onOverlayLayersCleared = (): void => {
       sql.onOverlayLayersCleared();
       pick.onOverlayLayersCleared();
@@ -357,6 +388,9 @@ struct Index {
       this.openMediaEdit(placemark, ctx);
     };
     this.bindPickRouter(pickRouter, ctx);
+    // 几何编辑态门控：编辑期间单击/长按整体交编辑控制器（画线加点/选靶），不弹详情与圆菜单
+    pickRouter.isGeomEditing = (): boolean => geomEdit.phase() !== GeomEditPhase.NONE;
+    pickRouter.handleEditTap = (x: number, y: number): boolean => geomEdit.handleTap(x, y);
 
     // 单击回调在此就挂上：必须在下面那串 await（相机就位/矢量层装配/叠加层重建）之前——
     // 放在尾部时，任一 await 卡住或抛异常都会让 setOnTapListener 永不执行，
@@ -471,6 +505,7 @@ struct Index {
     this.sql = sql;
     this.pick = pick;
     this.capture = capture;
+    this.geomEdit = geomEdit;
     services.view = view;
     services.layers = layers;
     services.overlays = overlays;
@@ -557,9 +592,9 @@ struct Index {
 
   /**
    * 长按圆菜单（对应 Android MainActivity.showMapPieMenu，并把它那份 showFeatureEditMenu 合成一项）：
-   * 以落点为锚弹快捷动作，图标在上、文案在下（见 PieMenuLayer）；命中要素时首位多挂一项「编辑」，
-   * 它按同一落点重跑单击的分流（文件要素→详情/属性页，测量/轨迹/拍照点位/样地→各自详情层），
-   * 于是一份菜单同时管「落点」和「要素」两种语义。
+   * 以落点为锚弹快捷动作，图标在上、文案在下（见 PieMenuLayer）；命中要素时首位多挂一项：
+   * gdb/shp 文件要素挂「编辑」（进几何编辑模式），其余挂「属性」（按同一落点重跑单击分流：
+   * 测量/轨迹/拍照点位/样地→各自详情层），于是一份菜单同时管「落点」和「要素」两种语义。
    * 锚点口径：native 回传 px（与 screenToGeo 同一引擎口径），浮层是 ArkUI 布局要 vp，故 ÷densityPixels。
    * 兴趣点仍守「确认后才建点」：点位记录在点「添加兴趣点」之后才落库，取消/收起不留空点。
    */
@@ -572,13 +607,27 @@ struct Index {
     const pick: FeaturePickController | undefined = this.pick;
     const actions: PieMenuAction[] = [];
     if (hasFeature) {
-      actions.push(new PieMenuAction($rawfile('ic_pie_edit.svg'), '编辑', (): void => {
-        if (pick === undefined) {
-          AppLog.w('[PieMenu] 编辑：拾取控制器未就绪');
-          return;
-        }
-        pick.editHitAt(xPx, yPx);
-      }));
+      // gdb/shp 文件要素 →「编辑」进几何编辑模式（分割/删除/合并）；
+      // 其余（业务叠加/其他格式）→「属性」走原详情分流（原「编辑」项改名，语义不变）
+      const ge: GeomEditController | undefined = this.geomEdit;
+      if (ge !== undefined && ge.editableHitAt(xPx, yPx)) {
+        actions.push(new PieMenuAction($rawfile('ic_pie_edit.svg'), '编辑', (): void => {
+          const edit: GeomEditController | undefined = this.geomEdit;
+          if (edit === undefined) {
+            AppLog.w('[PieMenu] 编辑：几何编辑控制器未就绪');
+            return;
+          }
+          edit.enterAt(xPx, yPx);
+        }));
+      } else {
+        actions.push(new PieMenuAction($rawfile('ic_pie_edit.svg'), '属性', (): void => {
+          if (pick === undefined) {
+            AppLog.w('[PieMenu] 属性：拾取控制器未就绪');
+            return;
+          }
+          pick.editHitAt(xPx, yPx);
+        }));
+      }
     }
     // 居中到此处：相机平移到落点，保留当前缩放级别
     actions.push(new PieMenuAction($rawfile('ic_pie_center.svg'), '居中到此处', (): void => {
@@ -1026,9 +1075,9 @@ struct Index {
     if (path.length === 0 || nav === undefined || doc === null) {
       return;
     }
-    for (let i = 0; i < doc.vectorLayers.length; i++) {
+    for (let i = doc.vectorLayers.length - 1; i >= 0; i--) {
       if (doc.vectorLayers[i].path === path) {
-        nav.zoomToLayerExtent(path);
+        nav.zoomToLayerExtent(path, doc.vectorLayers[i].layerName);
         return;
       }
     }
@@ -1198,6 +1247,18 @@ struct Index {
     }
   }
 
+  /** 几何编辑提示文案（顶部胶囊）：按阶段与目标几何类型回显 */
+  private geomHintText(): string {
+    if (this.geomPhase === GeomEditPhase.SPLIT_LINE) {
+      return `画分割线：已点 ${this.geomSplitPoints} 个点（至少 2 点后点「完成」）`;
+    }
+    if (this.geomPhase === GeomEditPhase.MERGE_PICK) {
+      return '请点击要合并的另一个面图斑（同一图层）';
+    }
+    return this.geomIsPolygon ? `几何编辑：要素 #${this.geomFid}`
+      : `几何编辑：要素 #${this.geomFid}（线/点仅支持删除）`;
+  }
+
   // ── 界面 ─────────────────────────────────────────────────────────
 
   build() {
@@ -1245,7 +1306,7 @@ struct Index {
         // 左栏：指北 → 测量 → 设置/定位/轨迹（2D/3D 切换键与 GO 键均已删，前者改由设置页控制、后者改挂中心坐标文本）
         Column() {
           Row({ space: 5 }) {
-            if (this.compassVisible) {
+            if (this.compassVisible && this.geomPhase === GeomEditPhase.NONE) {
               MapIconButton({
                 label: '北',
                 action: (): void => {
@@ -1260,12 +1321,14 @@ struct Index {
           Column()
             .layoutWeight(7)
             .hitTestBehavior(HitTestMode.None)
-          MapIconButton({
-            label: '测量',
-            action: (): void => {
-              this.openMeasureMenu();
-            },
-          })
+          if (this.geomPhase === GeomEditPhase.NONE) {
+            MapIconButton({
+              label: '测量',
+              action: (): void => {
+                this.openMeasureMenu();
+              },
+            })
+          }
           Column()
             .layoutWeight(3)
             .hitTestBehavior(HitTestMode.None)
@@ -1288,33 +1351,37 @@ struct Index {
           .layoutWeight(1)
           .hitTestBehavior(HitTestMode.None)
 
-        // 右栏：图层 → 工程 → 拍照 → 注记 / 缩放面板
+        // 右栏：图层 → 工程 → 拍照 → 注记 / 缩放面板（几何编辑态隐藏图层/工程/拍照，保留注记与缩放）
         Column() {
-          MapIconButton({
-            label: '图层',
-            action: (): void => {
-              const params: LayerManageParams = new LayerManageParams();
-              params.tab = 0;
-              router.pushUrl({ url: 'pages/LayerManagePage', params: params });
-            },
-          })
-          // 工程管理入口（0.4.0.0 工程模块，对齐 Android jni_map_project：右栏图层键正下方）
-          MapIconButton({
-            label: '工程',
-            action: (): void => {
-              router.pushUrl({ url: 'pages/ProjectManagePage' });
-            },
-          })
-            .margin({ top: 5 })
+          if (this.geomPhase === GeomEditPhase.NONE) {
+            MapIconButton({
+              label: '图层',
+              action: (): void => {
+                const params: LayerManageParams = new LayerManageParams();
+                params.tab = 0;
+                router.pushUrl({ url: 'pages/LayerManagePage', params: params });
+              },
+            })
+            // 工程管理入口（0.4.0.0 工程模块，对齐 Android jni_map_project：右栏图层键正下方）
+            MapIconButton({
+              label: '工程',
+              action: (): void => {
+                router.pushUrl({ url: 'pages/ProjectManagePage' });
+              },
+            })
+              .margin({ top: 5 })
+          }
           Column()
             .layoutWeight(7)
             .hitTestBehavior(HitTestMode.None)
-          MapIconButton({
-            label: '拍照',
-            action: (): void => {
-              this.showPhotoMenu();
-            },
-          })
+          if (this.geomPhase === GeomEditPhase.NONE) {
+            MapIconButton({
+              label: '拍照',
+              action: (): void => {
+                this.showPhotoMenu();
+              },
+            })
+          }
           Column()
             .layoutWeight(3)
             .hitTestBehavior(HitTestMode.None)
@@ -1376,6 +1443,100 @@ struct Index {
         .position({ x: '50%', y: '100%' })
         .markAnchor({ x: '50%', y: '100%' })
         .padding({ bottom: Math.max(STATUS_HEIGHT, this.bottomInset) + TOOL_BOTTOM_GAP })
+        .hitTestBehavior(HitTestMode.None)
+      }
+
+      // 底部居中：几何编辑工具条（长按菜单「编辑」命中 gdb/shp 要素后出现）。
+      // 待命=分割/删除/合并/退出（线/点层仅删除）；画线=撤销/完成/取消；选靶=取消。
+      if (this.geomPhase === GeomEditPhase.EDIT) {
+        Row({ space: 6 }) {
+          if (this.geomIsPolygon) {
+            this.chip('分割', (): void => {
+              const ge: GeomEditController | undefined = this.geomEdit;
+              if (ge !== undefined) {
+                ge.startSplit();
+              }
+            })
+          }
+          this.chip('删除', (): void => {
+            const ge: GeomEditController | undefined = this.geomEdit;
+            if (ge !== undefined) {
+              ge.requestDelete();
+            }
+          })
+          if (this.geomIsPolygon) {
+            this.chip('合并', (): void => {
+              const ge: GeomEditController | undefined = this.geomEdit;
+              if (ge !== undefined) {
+                ge.startMergePick();
+              }
+            })
+          }
+          this.chip('退出', (): void => {
+            const ge: GeomEditController | undefined = this.geomEdit;
+            if (ge !== undefined) {
+              ge.exit();
+            }
+          })
+        }
+        .position({ x: '50%', y: '100%' })
+        .markAnchor({ x: '50%', y: '100%' })
+        .padding({ bottom: Math.max(STATUS_HEIGHT, this.bottomInset) + TOOL_BOTTOM_GAP })
+        .hitTestBehavior(HitTestMode.None)
+      }
+      if (this.geomPhase === GeomEditPhase.SPLIT_LINE) {
+        Row({ space: 6 }) {
+          this.chip('撤销', (): void => {
+            const ge: GeomEditController | undefined = this.geomEdit;
+            if (ge !== undefined) {
+              ge.undoSplitPoint();
+            }
+          })
+          this.chip('完成', (): void => {
+            const ge: GeomEditController | undefined = this.geomEdit;
+            if (ge !== undefined) {
+              ge.finishSplit();
+            }
+          })
+          this.chip('取消', (): void => {
+            const ge: GeomEditController | undefined = this.geomEdit;
+            if (ge !== undefined) {
+              ge.cancelSplit();
+            }
+          })
+        }
+        .position({ x: '50%', y: '100%' })
+        .markAnchor({ x: '50%', y: '100%' })
+        .padding({ bottom: Math.max(STATUS_HEIGHT, this.bottomInset) + TOOL_BOTTOM_GAP })
+        .hitTestBehavior(HitTestMode.None)
+      }
+      if (this.geomPhase === GeomEditPhase.MERGE_PICK) {
+        Row({ space: 6 }) {
+          this.chip('取消', (): void => {
+            const ge: GeomEditController | undefined = this.geomEdit;
+            if (ge !== undefined) {
+              ge.cancelMergePick();
+            }
+          })
+        }
+        .position({ x: '50%', y: '100%' })
+        .markAnchor({ x: '50%', y: '100%' })
+        .padding({ bottom: Math.max(STATUS_HEIGHT, this.bottomInset) + TOOL_BOTTOM_GAP })
+        .hitTestBehavior(HitTestMode.None)
+      }
+
+      // 顶部居中：几何编辑提示胶囊（下移一行避开「矢量加载中」胶囊；不拦截地图手势）
+      if (this.geomPhase !== GeomEditPhase.NONE) {
+        Row() {
+          Text(this.geomHintText())
+            .fontSize(Theme.FONT_SUB)
+            .fontColor(Theme.TEXT_ON_DARK)
+        }
+        .padding({ left: 12, right: 12, top: 6, bottom: 6 })
+        .backgroundColor(PILL_BG)
+        .borderRadius(14)
+        .position({ x: '50%', y: TOP_MARGIN + 34 })
+        .markAnchor({ x: '50%', y: 0 })
         .hitTestBehavior(HitTestMode.None)
       }
 
@@ -1498,57 +1659,60 @@ struct Index {
 
   /** 方形图标按钮已抽为文件末尾的 MapIconButton 组件（理由见该组件注释），此处只剩文本动作胶囊 */
 
-  /** 左下按钮群：设置 / 定位（跟随）/ 轨迹采集（暂停·停止）/ 轨迹 —— 竖屏竖排、横屏横排共用 */
+  /** 左下按钮群：设置 / 定位（跟随）/ 轨迹采集（暂停·停止）/ 轨迹 —— 竖屏竖排、横屏横排共用；
+   *  几何编辑态整组隐藏（编辑期间不做定位/轨迹/设置操作） */
   @Builder
   hudLeftBottom() {
-    MapIconButton({
-      label: '设置',
-      action: (): void => {
-        router.pushUrl({ url: 'pages/SettingsPage' });
-      },
-    })
-    MapIconButton({
-      // 标签反映跟随锁定态（现由轨迹记录驱动）；点击按记录态分流（非记录单次定位、记录中切换锁定）
-      label: this.following ? '跟随' : '定位',
-      action: (): void => {
-        this.focusLocation();
-      },
-    })
-    if (this.trackRecording) {
+    if (this.geomPhase === GeomEditPhase.NONE) {
       MapIconButton({
-        label: this.trackPaused ? '继续' : '暂停',
+        label: '设置',
         action: (): void => {
-          const track: TrackController | undefined = this.track;
-          if (track === undefined) {
-            return;
-          }
-          if (track.isPaused()) {
-            track.resume();
-          } else {
-            track.pause();
-          }
+          router.pushUrl({ url: 'pages/SettingsPage' });
         },
       })
       MapIconButton({
-        label: '停止',
+        // 标签反映跟随锁定态（现由轨迹记录驱动）；点击按记录态分流（非记录单次定位、记录中切换锁定）
+        label: this.following ? '跟随' : '定位',
         action: (): void => {
-          const track: TrackController | undefined = this.track;
-          if (track !== undefined) {
-            track.stop();
-          }
+          this.focusLocation();
         },
       })
+      if (this.trackRecording) {
+        MapIconButton({
+          label: this.trackPaused ? '继续' : '暂停',
+          action: (): void => {
+            const track: TrackController | undefined = this.track;
+            if (track === undefined) {
+              return;
+            }
+            if (track.isPaused()) {
+              track.resume();
+            } else {
+              track.pause();
+            }
+          },
+        })
+        MapIconButton({
+          label: '停止',
+          action: (): void => {
+            const track: TrackController | undefined = this.track;
+            if (track !== undefined) {
+              track.stop();
+            }
+          },
+        })
+      }
+      // 「轨迹」入口键：记录中隐藏（改由上方暂停/停止键接管），停止/完成记录后随 trackRecording 转 false 复现
+      if (!this.trackRecording) {
+        MapIconButton({
+          label: '轨迹',
+          action: (): void => {
+            this.openTrackMenu();
+          },
+        })
+      }
+      // 「移动到」不再占一枚键：Android 已删 jni_map_go，入口改为中心坐标文本点击（见底部状态栏）
     }
-    // 「轨迹」入口键：记录中隐藏（改由上方暂停/停止键接管），停止/完成记录后随 trackRecording 转 false 复现
-    if (!this.trackRecording) {
-      MapIconButton({
-        label: '轨迹',
-        action: (): void => {
-          this.openTrackMenu();
-        },
-      })
-    }
-    // 「移动到」不再占一枚键：Android 已删 jni_map_go，入口改为中心坐标文本点击（见底部状态栏）
   }
 
   /** 右下按钮群：注记显隐 + 缩放面板（＋ / 级别 / －）—— 竖屏竖排、横屏横排共用 */

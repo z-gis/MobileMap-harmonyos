@@ -10,6 +10,7 @@ const MAX_LIST_HEIGHT: number = 300;
 
 @CustomDialog
 export struct OptionListDialog {
+  /** @CustomDialog 要求必须声明 controller；本组件不自关，统一由持有者关闭 */
   controller: CustomDialogController;
   title: string = '';
   /** 说明文案（为空不显示） */
@@ -20,6 +21,8 @@ export struct OptionListDialog {
   emptyText: string = '没有可选项';
   /** 选中回调（参数为 options 下标） */
   onPick: (index: number) => void = (): void => {};
+  /** 取消回调（点「取消」或返回键关闭时触发） */
+  onCancel: () => void = (): void => {};
 
   build() {
     Column({ space: 10 }) {
@@ -57,7 +60,6 @@ export struct OptionListDialog {
                 .borderRadius(6)
                 .onClick((): void => {
                   this.onPick(index);
-                  this.controller.close();
                 })
             }
           }, (name: string, index: number): string => `${index}|${name}`)
@@ -74,7 +76,7 @@ export struct OptionListDialog {
         .fontColor(Theme.TEXT_SUB)
         .backgroundColor(Theme.SUBTLE)
         .onClick((): void => {
-          this.controller.close();
+          this.onCancel();
         })
     }
     .width('86%')

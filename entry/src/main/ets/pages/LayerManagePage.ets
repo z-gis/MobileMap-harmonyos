@@ -16,6 +16,7 @@ import { router } from '@kit.ArkUI';
 import { AppDirs } from '../common/AppDirs';
 import { AppLog } from '../common/AppLog';
 import { ColorHex } from '../common/ColorHex';
+import { LayerFileDeleter } from '../common/LayerFileDeleter';
 import { PageData, PageKeys } from '../common/PageData';
 import { Theme } from '../common/Theme';
 import { Ui } from '../common/Ui';
@@ -25,13 +26,16 @@ import { FeatureDetailRequest } from '../map/FeaturePickController';
 import { MapServices } from '../map/MapServices';
 import { MapStyle } from '../map/MapStyle';
 import { GdalVectorReader } from '../vector/GdalVectorReader';
+import { FeatureIcons } from '../vector/FeatureIcons';
 import { VectorFormats } from '../vector/VectorFormats';
+import { VectorMetaCache } from '../vector/VectorMetaCache';
 import { LayerLevelDialog } from '../components/LayerLevelDialog';
 import { LayerGroupDialog } from '../components/LayerGroupDialog';
 import { LayerInfoDialog, LayerInfoItem } from '../components/LayerInfoDialog';
 import { LayerStylePreview } from '../components/LayerStylePreview';
 import { MapSourceList } from '../components/MapSourceList';
 import { NameEditDialog } from '../components/NameEditDialog';
+import { RemoveLayerDialog } from '../components/RemoveLayerDialog';
 import { SqlQueryDialog } from '../components/SqlQueryDialog';
 import { TitleBar } from '../components/TitleBar';
 import { AddLayerParams } from './RouteParams';
@@ -45,7 +49,7 @@ const TAB_MAP_SOURCE: number = 2;
 const DEFAULT_SHAPE_FILL: string = '#664A8FE3';
 const DEFAULT_SHAPE_OUTLINE: string = '#FFFFFFFF';
 /** 标注色 / 标注轮廓色未设置时的缺省色串（与要素详情页默认标注色一致） */
-const DEFAULT_LABEL: string = '#FF212121';
+const DEFAULT_LABEL: string = '#FFFFFFFF';
 const DEFAULT_LABEL_OUTLINE: string = '#FF000000';
 /** 大小未知的展示文本（Android R.string.layer_info_size_unknown） */
 const SIZE_UNKNOWN: string = '未知';
@@ -66,6 +70,8 @@ class LayerRow {
   collapsed: boolean = false;
   name: string = '';
   path: string = '';
+  /** 数据集内要素类名（GDB）；空串为普通单图层文件 */
+  layerName: string = '';
   vector: boolean = true;
   visible: boolean = true;
   /** 矢量页签内的单选高亮 */
@@ -80,7 +86,14 @@ class LayerRow {
   fillEnabled: boolean = true;
   outline: string = DEFAULT_SHAPE_OUTLINE;
   outlineWidth: number = 1;
+  /** 几何类型（0 点 / 1 线 / 2 面 / -1 未知）：预览线层画折线示例 */
+  geomType: number = -1;
+  /** 点层预览图标 key 与着色（着色同渲染口径：outlineColor 未设取线通道默认橙） */
+  iconKey: string = FeatureIcons.DEFAULT_KEY;
+  iconColor: string = '';
   labelField: string = '';
+  /** 标注样本值（数据首条非空注记值）：预览示例文本，空则回退字段名 */
+  labelText: string = '';
   labelColor: string = DEFAULT_LABEL;
   labelScale: number = 1;
   labelOutline: boolean = false;
@@ -92,8 +105,15 @@ class LayerRow {
       return `h|${this.groupId}|${this.groupName}|${this.count}|${this.allVisible}|${this.collapsed}`;
     }
     return `${this.path}|${this.visible}|${this.selected}|${this.minLevel}|${this.fill}|${this.fillEnabled}`
-      + `|${this.outline}|${this.outlineWidth}|${this.labelField}|${this.name}|${this.groupId}`;
+      + `|${this.outline}|${this.outlineWidth}|${this.labelField}|${this.labelText}|${this.labelColor}`
+      + `|${this.labelScale}|${this.labelOutline}|${this.labelOutlineColor}|${this.name}|${this.groupId}`;
   }
+}
+
+/** 拖拽落盘用的显示节：组 id + 该节当前显示的图层行（不含组头） */
+class DragSection {
+  groupId: number = LayerInfo.UNGROUPED_ID;
+  rows: LayerRow[] = [];
 }
 
 @Entry
@@ -105,6 +125,8 @@ struct LayerManagePage {
   @State rows: LayerRow[] = [];
   /** 矢量页签单选高亮路径（Android selectedVectorPath） */
   @State selectedPath: string = '';
+  /** 单选高亮要素类名（GDB 同路径多图层时区分） */
+  private selectedLayerName: string = '';
   /** MapSourceList 刷新令牌：切页签 / 子页返回时递增触发其重载 */
   @State sourceToken: number = 0;
   @State activeSource: string = '';
@@ -114,11 +136,17 @@ struct LayerManagePage {
    */
   @State collapsedIds: number[] = [];
 
+  /** 拖拽排序状态：拖动期间行序由 onItemDragMove 就地维护，文档广播不得重建列表 */
+  private dragging: boolean = false;
+  private dragIndex: number = -1;
+  private dragRow: LayerRow | undefined = undefined;
+
   private levelDialog: CustomDialogController | undefined = undefined;
   private sqlDialog: CustomDialogController | undefined = undefined;
   private infoDialog: CustomDialogController | undefined = undefined;
   private groupDialog: CustomDialogController | undefined = undefined;
   private moveDialog: CustomDialogController | undefined = undefined;
+  private removeDialog: CustomDialogController | undefined = undefined;
   private docListener: DocumentListener | undefined = undefined;
 
   aboutToAppear(): void {
@@ -147,6 +175,10 @@ struct LayerManagePage {
   // ── 列表同步 ────────────────────────────────────────────────────
 
   private sync(): void {
+    // 拖动中不重建：行序暂由拖拽维护，落盘（commitDragOrder）后才按文档重排
+    if (this.dragging) {
+      return;
+    }
     const doc: MapDocument | null = DocumentManager.getInstance().getDocument();
     const out: LayerRow[] = [];
     if (doc !== null && this.tab !== TAB_MAP_SOURCE) {
@@ -174,13 +206,16 @@ struct LayerManagePage {
       }
     }
     // 选中态清理：非矢量页签、或选中图层已被移除时不残留高亮（Android syncFromDocument 同）
-    let selected: string = this.tab === TAB_VECTOR ? this.selectedPath : '';
-    if (selected.length > 0 && !out.some((r: LayerRow): boolean => r.path === selected)) {
-      selected = '';
+    const selected: string = this.tab === TAB_VECTOR ? this.selectedPath : '';
+    const selectedLayer: string = this.tab === TAB_VECTOR ? this.selectedLayerName : '';
+    if (selected.length > 0
+      && !out.some((r: LayerRow): boolean => r.path === selected && r.layerName === selectedLayer)) {
+      this.selectedPath = '';
+      this.selectedLayerName = '';
     }
-    this.selectedPath = selected;
     for (let i = 0; i < out.length; i++) {
-      out[i].selected = out[i].path === selected && selected.length > 0;
+      out[i].selected = out[i].path === this.selectedPath && out[i].layerName === this.selectedLayerName
+        && this.selectedPath.length > 0;
     }
     this.rows = out;
     this.activeSource = DocumentManager.getInstance().activeBaseMap();
@@ -218,6 +253,13 @@ struct LayerManagePage {
   }
 
   private appendLayers(out: LayerRow[], members: LayerInfo[], vector: boolean): void {
+    // 矢量列表顶 = 最上层（doc 数组尾 = 压盖顶，倒序显示；栅格本批不参与排序，保持原序）
+    if (vector) {
+      for (let i = members.length - 1; i >= 0; i--) {
+        out.push(this.buildRow(members[i], vector));
+      }
+      return;
+    }
     for (let i = 0; i < members.length; i++) {
       out.push(this.buildRow(members[i], vector));
     }
@@ -238,27 +280,214 @@ struct LayerManagePage {
     this.sync();
   }
 
+  // ── 拖拽排序（矢量页签；组纯显示分节，跨组拖动 = 移组 + 改序，组头不可拖）──
+
+  /** 起拖：仅矢量图层行可拖；组头/栅格返回 undefined 取消。返回浮起卡片 builder */
+  private handleDragStart(itemIndex: number): (() => void) | void {
+    const row: LayerRow | undefined = this.rows[itemIndex];
+    if (row === undefined || row.header || !row.vector || this.tab !== TAB_VECTOR) {
+      return undefined;
+    }
+    this.dragging = true;
+    this.dragIndex = itemIndex;
+    this.dragRow = row;
+    return (): void => {
+      this.dragCard();
+    };
+  }
+
+  /** 拖动中就地挪行（不落盘）：组头落点夹取到节内，折叠组头落点 = 该节显示顶部 */
+  private handleDragMove(insertIndex: number): void {
+    if (!this.dragging || insertIndex < 0 || insertIndex >= this.rows.length) {
+      return;
+    }
+    const from: number = this.dragIndex;
+    let to: number = insertIndex;
+    const target: LayerRow = this.rows[to];
+    if (target.header) {
+      if (target.collapsed) {
+        to = to > from ? to : to + 1;
+      } else {
+        const end: number = this.sectionEnd(to);
+        to = to > from ? to : (from < end ? end - 1 : end);
+      }
+    }
+    if (to === from || to < 0 || to >= this.rows.length) {
+      return;
+    }
+    const moved: LayerRow[] = this.rows.splice(from, 1);
+    this.rows.splice(to, 0, moved[0]);
+    this.dragIndex = to;
+  }
+
+  /** 组头节尾（下一个组头下标，无则数组长度） */
+  private sectionEnd(headerIndex: number): number {
+    for (let i = headerIndex + 1; i < this.rows.length; i++) {
+      if (this.rows[i].header) {
+        return i;
+      }
+    }
+    return this.rows.length;
+  }
+
+  /** 落点：成功按显示序落盘，失败回滚到文档序 */
+  private handleDragDrop(isSuccess: boolean): void {
+    if (!this.dragging) {
+      return;
+    }
+    this.dragging = false;
+    this.dragIndex = -1;
+    this.dragRow = undefined;
+    if (isSuccess) {
+      this.commitDragOrder();
+    } else {
+      this.sync();
+    }
+  }
+
+  /**
+   * 显示序 → doc.vectorLayers：节倒序 × 节内行倒序 = 压盖序（数组尾 = 最上层）。
+   * 折叠节保持旧成员相对序，拖入的行展开置顶；跨节行改写 groupId；未显示成员兜底置底。
+   * 只改数组位置，一次 save → 监听器广播 → sync 下发 order，零新增持久化字段。
+   */
+  private commitDragOrder(): void {
+    const doc: MapDocument | null = DocumentManager.getInstance().getDocument();
+    if (doc === null) {
+      this.sync();
+      return;
+    }
+    const oldOrder: LayerInfo[] = doc.vectorLayers.slice();
+    const byKey: Map<string, LayerInfo> = new Map<string, LayerInfo>();
+    for (let i = 0; i < oldOrder.length; i++) {
+      byKey.set(`${oldOrder[i].path ?? ''}|${oldOrder[i].layerName}`, oldOrder[i]);
+    }
+    const sections: DragSection[] = [];
+    let current: DragSection | undefined = undefined;
+    for (let i = 0; i < this.rows.length; i++) {
+      const r: LayerRow = this.rows[i];
+      if (r.header) {
+        current = new DragSection();
+        current.groupId = r.groupId;
+        sections.push(current);
+      } else if (current !== undefined) {
+        current.rows.push(r);
+      }
+    }
+    const reordered: LayerInfo[] = [];
+    const placed: Set<string> = new Set<string>();
+    let groupChanged: boolean = false;
+    let expanded: boolean = false;
+    for (let s = sections.length - 1; s >= 0; s--) {
+      const sec: DragSection = sections[s];
+      const displayed: LayerRow[] = sec.rows;
+      if (this.isCollapsed(sec.groupId)) {
+        for (let i = 0; i < oldOrder.length; i++) {
+          const li: LayerInfo = oldOrder[i];
+          if (li.groupId === sec.groupId) {
+            reordered.push(li);
+            placed.add(`${li.path ?? ''}|${li.layerName}`);
+          }
+        }
+        if (displayed.length > 0) {
+          const ci: number = this.collapsedIds.indexOf(sec.groupId);
+          if (ci >= 0) {
+            this.collapsedIds.splice(ci, 1);
+            expanded = true;
+          }
+        }
+      }
+      for (let i = displayed.length - 1; i >= 0; i--) {
+        const r: LayerRow = displayed[i];
+        const key: string = `${r.path}|${r.layerName}`;
+        const li: LayerInfo | undefined = byKey.get(key);
+        if (li === undefined || placed.has(key)) {
+          continue;
+        }
+        if (li.groupId !== sec.groupId) {
+          li.groupId = sec.groupId;
+          groupChanged = true;
+        }
+        reordered.push(li);
+        placed.add(key);
+      }
+    }
+    const orphans: LayerInfo[] = [];
+    for (let i = 0; i < oldOrder.length; i++) {
+      const li: LayerInfo = oldOrder[i];
+      if (!placed.has(`${li.path ?? ''}|${li.layerName}`)) {
+        orphans.push(li);
+      }
+    }
+    for (let i = 0; i < orphans.length; i++) {
+      reordered.splice(i, 0, orphans[i]);
+    }
+    if (expanded) {
+      this.collapsedIds = this.collapsedIds.slice();
+    }
+    let same: boolean = !groupChanged && reordered.length === oldOrder.length;
+    if (same) {
+      for (let i = 0; i < reordered.length; i++) {
+        if (reordered[i] !== oldOrder[i]) {
+          same = false;
+          break;
+        }
+      }
+    }
+    if (same) {
+      this.sync();
+      return;
+    }
+    doc.vectorLayers = reordered;
+    AppLog.i('LayerManagePage', `拖拽排序落盘：${reordered.length} 层，移组=${groupChanged}`);
+    DocumentManager.getInstance().save();
+    this.sync();
+  }
+
+  /** 拖拽浮起卡片：样式色块 + 名称（行快照在起拖时定格） */
+  @Builder
+  dragCard() {
+    Row({ space: 10 }) {
+      Column()
+        .width(18)
+        .height(18)
+        .borderRadius(4)
+        .backgroundColor(this.dragRow !== undefined ? this.dragRow.fill : DEFAULT_SHAPE_FILL)
+      Text(this.dragRow !== undefined ? this.dragRow.name : '')
+        .fontSize(Theme.FONT)
+        .fontColor(Theme.TEXT)
+        .maxLines(1)
+        .textOverflow({ overflow: TextOverflow.Ellipsis })
+        .layoutWeight(1)
+    }
+    .width('100%')
+    .padding(12)
+    .backgroundColor(Theme.CARD)
+    .borderRadius(Theme.RADIUS)
+    .opacity(0.9)
+  }
+
   /** 行视图模型：样式预览色解析链与 Android drawStylePreview 同序 */
   private buildRow(info: LayerInfo, vector: boolean): LayerRow {
     const row: LayerRow = new LayerRow();
     const path: string = info.path ?? '';
     row.path = path;
     row.vector = vector;
-    row.name = LayerManagePage.displayName(path, info.name ?? '');
+    row.layerName = info.layerName;
+    const base: string = LayerManagePage.displayName(path, info.name ?? '');
+    row.name = info.layerName.length > 0 ? `${base} / ${info.layerName}` : base;
     row.visible = info.visible;
     row.groupId = info.groupId;
-    const ext: string = VectorFormats.extOf(path);
-    row.sqlQueryable = vector && (ext === 'shp' || ext === 'gpkg');
+    row.sqlQueryable = vector && VectorFormats.sqlQueryable(path);
     row.levelVisible = vector;
     row.minLevel = vector ? info.effectiveMinDisplayLevel() : -1;
-    // 整层样式编辑开放范围与 Android onStyleClick 一致（dwg/dxf 只读不改样式）
-    row.styleEditable = vector && (ext === 'shp' || ext === 'kml' || ext === 'kmz' || ext === 'gpkg');
+    // 整层样式编辑开放范围以能力主表为准（kml/kmz 自带样式，不开放整层样式编辑）
+    row.styleEditable = vector && VectorFormats.styleEditable(path);
 
     const style: StyleOverride | undefined = vector ? info.vectorStyle : undefined;
     let render: string[] = ['', ''];
     const layers = MapServices.instance.layers;
     if (vector && layers !== undefined) {
-      render = layers.layerRenderColorsOf(path);
+      render = layers.layerRenderColorsOf(path, info.layerName);
     }
     row.fill = LayerManagePage.firstOf(style === undefined ? undefined : style.fillColor,
       render.length > 0 ? render[0] : '');
@@ -266,16 +495,40 @@ struct LayerManagePage {
     row.outline = LayerManagePage.firstOf(style === undefined ? undefined : style.outlineColor,
       render.length > 1 ? render[1] : '');
     const width: number | undefined = style === undefined ? undefined : style.outlineWidth;
-    row.outlineWidth = width === undefined ? 1 : width;
-    const labelField: string | undefined = style === undefined ? undefined : style.labelField;
-    row.labelField = labelField === undefined ? '' : labelField;
+    const geom: number = vector ? VectorMetaCache.geomTypeOf(info) : -1;
+    row.geomType = geom;
+    // 未加载（render 空）兜底：线层第二色取线通道默认橙，面描边默认白对线层是误导
+    if (row.outline.length === 0) {
+      row.outline = geom === 1 ? MapStyle.argbToHex(MapStyle.DEFAULT_LINE_COLOR) : DEFAULT_SHAPE_OUTLINE;
+    }
+    row.outlineWidth = width === undefined
+      ? (geom === 1 ? MapStyle.DEFAULT_LINE_WIDTH : MapStyle.DEFAULT_OUTLINE_WIDTH) : width;
+    row.iconKey = FeatureIcons.keyOf(style);
+    const iconOutline: string = LayerManagePage.firstOf(
+      style === undefined ? undefined : style.outlineColor, '');
+    row.iconColor = iconOutline.length > 0 ? iconOutline : MapStyle.argbToHex(MapStyle.DEFAULT_LINE_COLOR);
+    // 标注有效样式与加图入地图同口径（MapLayerController.addVectorLayerNative）：
+    // KML 受 showKmlLabel 门控、字段缺省 Name、轮廓缺省开 + 白晕（白晕复用 DEFAULT_LABEL 白色）；
+    // 非 KML 仅读文档显式值（轮廓缺省关、晕色缺省黑）
+    const isKml: boolean = VectorFormats.isKml(path);
+    const doc: MapDocument | null = DocumentManager.getInstance().getDocument();
+    const showKmlLabel: boolean = doc === null ? true : doc.systemConfig.showKmlLabel;
+    const userField: string = (style === undefined || style.labelField === undefined)
+      ? '' : style.labelField.trim();
+    row.labelField = (isKml && !showKmlLabel) ? '' :
+      (isKml ? (userField.length > 0 ? userField : 'Name') : userField);
     row.labelColor = LayerManagePage.pick(LayerManagePage.firstOf(
       style === undefined ? undefined : style.labelColor, ''), DEFAULT_LABEL);
     const scale: number | undefined = style === undefined ? undefined : style.labelSize;
     row.labelScale = scale === undefined ? 1 : scale;
-    row.labelOutline = style !== undefined && style.labelOutline === true;
+    row.labelOutline = style !== undefined && style.labelOutline !== undefined
+      ? style.labelOutline : isKml;
     row.labelOutlineColor = LayerManagePage.pick(LayerManagePage.firstOf(
-      style === undefined ? undefined : style.labelOutlineColor, ''), DEFAULT_LABEL_OUTLINE);
+      style === undefined ? undefined : style.labelOutlineColor, ''),
+      isKml ? DEFAULT_LABEL : DEFAULT_LABEL_OUTLINE);
+    // 示例文本与地图渲染内容同口径：取数据首条非空注记值（指纹缓存），取不到回退字段名
+    row.labelText = row.labelField.length > 0
+      ? VectorMetaCache.labelSampleOf(path, info.layerName, row.labelField) : '';
     // 填充透明度单独设置时折进颜色（预览与 Android fillPaint.alpha 同效）
     const opacity: number | undefined = style === undefined ? undefined : style.fillOpacity;
     if (opacity !== undefined) {
@@ -343,10 +596,12 @@ struct LayerManagePage {
 
   /** 名称点击：仅选中高亮（Android 点名称不缩放，缩放另有按键） */
   private selectLayer(row: LayerRow): void {
-    if (this.tab !== TAB_VECTOR || this.selectedPath === row.path) {
+    if (this.tab !== TAB_VECTOR
+      || (this.selectedPath === row.path && this.selectedLayerName === row.layerName)) {
       return;
     }
     this.selectedPath = row.path;
+    this.selectedLayerName = row.layerName;
     this.sync();
   }
 
@@ -354,7 +609,7 @@ struct LayerManagePage {
     DocumentManager.getInstance().update((doc: MapDocument): void => {
       const list: LayerInfo[] = row.vector ? doc.vectorLayers : doc.rasterLayers;
       for (let i = 0; i < list.length; i++) {
-        if (list[i].path === row.path) {
+        if (list[i].path === row.path && list[i].layerName === row.layerName) {
           list[i].visible = !list[i].visible;
           break;
         }
@@ -363,23 +618,46 @@ struct LayerManagePage {
     this.sync();
   }
 
-  private async removeLayer(row: LayerRow): Promise<void> {
-    const ok: boolean = await Ui.confirm('移除确认',
-      `确定移除图层：${row.name} ？（仅从地图移除，不删除源文件）`, '移除');
-    if (!ok) {
-      return;
-    }
-    DocumentManager.getInstance().update((doc: MapDocument): void => {
-      const list: LayerInfo[] = row.vector ? doc.vectorLayers : doc.rasterLayers;
-      for (let i = 0; i < list.length; i++) {
-        if (list[i].path === row.path) {
-          list.splice(i, 1);
-          break;
+  private removeLayer(row: LayerRow): void {
+    // 「同时删除图层文件」选项：源文件存在且无其他图层共享删除目标（同 GDB 要素类/同 gpkg 层/同压缩包 shp）才提供
+    const doc: MapDocument | null = DocumentManager.getInstance().getDocument();
+    const others: string[] = [];
+    if (doc !== null) {
+      const all: LayerInfo[] = doc.vectorLayers.concat(doc.rasterLayers);
+      for (let i = 0; i < all.length; i++) {
+        const p: string = all[i].path ?? '';
+        if (p.length > 0 && !(p === row.path && all[i].layerName === row.layerName)) {
+          others.push(p);
         }
       }
+    }
+    const offer: boolean = LayerFileDeleter.offerDelete(row.path, others);
+    this.removeDialog = new CustomDialogController({
+      builder: RemoveLayerDialog({
+        layerName: row.name,
+        offerDelete: offer,
+        onConfirm: (deleteFile: boolean): void => {
+          DocumentManager.getInstance().update((d: MapDocument): void => {
+            const list: LayerInfo[] = row.vector ? d.vectorLayers : d.rasterLayers;
+            for (let i = 0; i < list.length; i++) {
+              if (list[i].path === row.path && list[i].layerName === row.layerName) {
+                list.splice(i, 1);
+                break;
+              }
+            }
+          });
+          this.sync();
+          if (deleteFile) {
+            LayerFileDeleter.deleteSource(row.path);
+          }
+          Ui.toast(deleteFile ? '已移除图层并删除源文件' : '已从地图移除图层');
+        },
+      }),
+      customStyle: true,
+      alignment: DialogAlignment.Center,
+      autoCancel: true,
     });
-    this.sync();
-    Ui.toast('已从地图移除图层');
+    this.removeDialog.open();
   }
 
   // ── 分组动作 ────────────────────────────────────────────────────
@@ -457,7 +735,8 @@ struct LayerManagePage {
         currentGroupId: row.groupId,
         groups: doc === null ? [] : doc.groups,
         onConfirmGroup: (groupId: number, newGroupName: string): void => {
-          DocumentManager.getInstance().moveLayerToGroup(row.path, row.vector, groupId, newGroupName);
+          DocumentManager.getInstance().moveLayerToGroup(row.path, row.vector, groupId, newGroupName,
+            row.layerName);
           this.sync();
         },
       }),
@@ -479,7 +758,7 @@ struct LayerManagePage {
       Ui.toast('无法获取图层范围');
       return;
     }
-    camera.zoomToLayerExtent(row.path);
+    camera.zoomToLayerExtent(row.path, row.layerName);
     Ui.toast('已缩放，返回地图查看');
   }
 
@@ -491,7 +770,7 @@ struct LayerManagePage {
     }
     const doc: MapDocument | null = DocumentManager.getInstance().getDocument();
     const info: LayerInfo | undefined = doc === null ? undefined
-      : doc.findVectorLayer(row.path);
+      : doc.findVectorLayer(row.path, row.layerName);
     if (info === undefined) {
       Ui.toast('图层未在文档中');
       return;
@@ -499,19 +778,26 @@ struct LayerManagePage {
     const req: FeatureDetailRequest = new FeatureDetailRequest();
     req.path = row.path;
     req.fid = -1;
-    req.layerName = row.name;
+    req.layerName = row.layerName.length > 0 ? row.layerName : row.name;
     req.layerStyleMode = true;
     req.styleEditable = true;
+    req.geomType = VectorMetaCache.geomTypeOf(info);
+    // 几何构成掩码：KML 层声明 wkbUnknown（geomType=-1），按要素采样出点/线/面节
+    req.geomMask = GdalVectorReader.geomMaskOf(row.path, row.layerName);
     req.style = info.vectorStyle ?? new StyleOverride();
     // 初值回退链：文档样式在页面内优先，这里只给「地图实际渲染色」这一层兜底
     const layers = MapServices.instance.layers;
+    // 未加载兜底：含线构成取线通道默认橙（面描边默认白对线层是误导）
+    const hasLine: boolean = req.geomType === 1 || (req.geomMask & 2) !== 0;
+    const outlineFallback: string = hasLine
+      ? MapStyle.argbToHex(MapStyle.DEFAULT_LINE_COLOR) : DEFAULT_SHAPE_OUTLINE;
     if (layers !== undefined) {
-      const render: string[] = layers.layerRenderColorsOf(row.path);
-      req.fallbackFill = render.length > 0 ? render[0] : DEFAULT_SHAPE_FILL;
-      req.fallbackOutline = render.length > 1 ? render[1] : DEFAULT_SHAPE_OUTLINE;
+      const render: string[] = layers.layerRenderColorsOf(row.path, row.layerName);
+      req.fallbackFill = render.length > 0 && render[0].length > 0 ? render[0] : DEFAULT_SHAPE_FILL;
+      req.fallbackOutline = render.length > 1 && render[1].length > 0 ? render[1] : outlineFallback;
     } else {
       req.fallbackFill = DEFAULT_SHAPE_FILL;
-      req.fallbackOutline = DEFAULT_SHAPE_OUTLINE;
+      req.fallbackOutline = outlineFallback;
     }
     // 复杂对象走交接槽（router params 只承载标量），与主地图页拾取弹详情同一条通道
     PageData.put(PageKeys.FEATURE_DETAIL, req);
@@ -520,7 +806,8 @@ struct LayerManagePage {
 
   private openLevelDialog(row: LayerRow): void {
     const doc: MapDocument | null = DocumentManager.getInstance().getDocument();
-    const info: LayerInfo | undefined = doc === null ? undefined : doc.findVectorLayer(row.path);
+    const info: LayerInfo | undefined = doc === null ? undefined
+      : doc.findVectorLayer(row.path, row.layerName);
     if (info === undefined) {
       Ui.toast('图层未在文档中');
       return;
@@ -533,10 +820,10 @@ struct LayerManagePage {
         initialLevel: info.userMinDisplayLevel >= 0 ? info.userMinDisplayLevel
           : (info.autoMinDisplayLevel >= 0 ? info.autoMinDisplayLevel : 0),
         onConfirmLevel: (level: number): void => {
-          this.writeUserLevel(row.path, level);
+          this.writeUserLevel(row.path, row.layerName, level);
         },
         onResetAuto: (): void => {
-          this.writeUserLevel(row.path, LayerInfo.UNSET_LEVEL);
+          this.writeUserLevel(row.path, row.layerName, LayerInfo.UNSET_LEVEL);
           Ui.toast('已恢复自动计算级别');
         },
       }),
@@ -547,9 +834,9 @@ struct LayerManagePage {
     this.levelDialog.open();
   }
 
-  private writeUserLevel(path: string, level: number): void {
+  private writeUserLevel(path: string, layerName: string, level: number): void {
     DocumentManager.getInstance().update((doc: MapDocument): void => {
-      const info: LayerInfo | undefined = doc.findVectorLayer(path);
+      const info: LayerInfo | undefined = doc.findVectorLayer(path, layerName);
       if (info !== undefined) {
         info.userMinDisplayLevel = level;
       }
@@ -559,14 +846,14 @@ struct LayerManagePage {
 
   /** SQL 查询：可视化条件对话框 → 交主地图页的查询控制器执行并高亮 */
   private openSqlDialog(row: LayerRow): void {
-    const fields: string[] = GdalVectorReader.fieldNames(row.path);
+    const fields: string[] = GdalVectorReader.fieldNames(row.path, row.layerName);
     this.sqlDialog = new CustomDialogController({
       builder: SqlQueryDialog({
         layerName: row.name,
-        tableName: LayerManagePage.tableNameOf(row.path),
+        tableName: LayerManagePage.tableNameOf(row.path, row.layerName),
         fields: fields,
         onExecuteSql: (sql: string): void => {
-          this.runQuery(row.path, sql);
+          this.runQuery(row.path, sql, row.layerName);
         },
         onClearResult: (): void => {
           const ctl = MapServices.instance.sql;
@@ -585,18 +872,21 @@ struct LayerManagePage {
     this.sqlDialog.open();
   }
 
-  private runQuery(path: string, sql: string): void {
+  private runQuery(path: string, sql: string, layerName: string = ''): void {
     const ctl = MapServices.instance.sql;
     if (ctl === undefined) {
       Ui.toast('地图未就绪，无法执行查询');
       return;
     }
-    ctl.runQuery(path, sql);
+    ctl.runQuery(path, sql, layerName);
     Ui.toastLong('查询已应用，返回地图查看高亮要素');
   }
 
-  /** SQL 表名：OGR 对 shp 的图层命名即文件主名（gpkg 亦按主名预填，用户可在语句内改） */
-  private static tableNameOf(path: string): string {
+  /** SQL 表名：GDB 用要素类名；其余 OGR 图层命名即文件主名（用户可在语句内改） */
+  private static tableNameOf(path: string, layerName: string = ''): string {
+    if (layerName.length > 0) {
+      return layerName;
+    }
     const query: number = path.indexOf('?');
     const s: string = query > 0 ? path.substring(0, query) : path;
     const slash: number = Math.max(s.lastIndexOf('/'), s.lastIndexOf('\\'));
@@ -607,9 +897,13 @@ struct LayerManagePage {
   private showInfo(row: LayerRow): void {
     const items: LayerInfoItem[] = [];
     items.push(new LayerInfoItem('名称', row.name));
-    items.push(new LayerInfoItem('类型', row.vector ? '矢量图层' : '栅格图层'));
+    if (row.layerName.length > 0) {
+      items.push(new LayerInfoItem('要素类', row.layerName));
+    }
+    items.push(new LayerInfoItem('类型',
+      row.vector ? LayerManagePage.geomTypeText(row.path, row.layerName) : '栅格图层'));
     items.push(new LayerInfoItem('大小', LayerManagePage.sizeText(row.path)));
-    items.push(new LayerInfoItem('坐标系', LayerManagePage.srsTextOf(row.path)));
+    items.push(new LayerInfoItem('坐标系', LayerManagePage.srsTextOf(row.path, row.layerName)));
     items.push(new LayerInfoItem('路径', row.path));
     this.infoDialog = new CustomDialogController({
       builder: LayerInfoDialog({ items: items }),
@@ -620,9 +914,35 @@ struct LayerManagePage {
     this.infoDialog.open();
   }
 
+  /** 矢量层几何子类型文案：点/线/面要素；混合几何（KML 常见）按构成列组合；未知回退「矢量图层」 */
+  private static geomTypeText(path: string, layerName: string = ''): string {
+    switch (VectorMetaCache.geomTypeOfPath(path, layerName)) {
+      case 0:
+        return '点要素';
+      case 1:
+        return '线要素';
+      case 2:
+        return '面要素';
+      default: {
+        const mask: number = GdalVectorReader.geomMaskOf(path, layerName);
+        const parts: string[] = [];
+        if ((mask & 1) !== 0) {
+          parts.push('点');
+        }
+        if ((mask & 2) !== 0) {
+          parts.push('线');
+        }
+        if ((mask & 4) !== 0) {
+          parts.push('面');
+        }
+        return parts.length > 0 ? `${parts.join('/')}要素` : '矢量图层';
+      }
+    }
+  }
+
   /** 坐标系名：原生返回「名称\nproj4」，界面只取首行 */
-  private static srsTextOf(path: string): string {
-    const srs: string | null = path.length === 0 ? null : GdalVectorReader.layerSrs(path);
+  private static srsTextOf(path: string, layerName: string = ''): string {
+    const srs: string | null = path.length === 0 ? null : GdalVectorReader.layerSrs(path, layerName);
     if (srs === null || srs === undefined) {
       return '未知';
     }
@@ -639,11 +959,35 @@ struct LayerManagePage {
         return SIZE_UNKNOWN;
       }
       const stat: fs.Stat = fs.statSync(path);
+      if (stat.isDirectory()) {
+        return LayerManagePage.formatSize(LayerManagePage.dirSizeOf(path));
+      }
       return LayerManagePage.formatSize(stat.size);
     } catch (e) {
       AppLog.w(`取文件大小失败: ${path}`, `${e}`);
       return SIZE_UNKNOWN;
     }
+  }
+
+  /** GDB 目录总大小（递归累加，失败按已统计部分返回） */
+  private static dirSizeOf(dirPath: string): number {
+    let total: number = 0;
+    let names: string[] = [];
+    try {
+      names = fs.listFileSync(dirPath, { recursion: false });
+    } catch (e) {
+      return total;
+    }
+    for (let i = 0; i < names.length; i++) {
+      const child: string = `${dirPath}/${names[i]}`;
+      try {
+        const st: fs.Stat = fs.statSync(child);
+        total += st.isDirectory() ? LayerManagePage.dirSizeOf(child) : st.size;
+      } catch (e) {
+        continue;
+      }
+    }
+    return total;
   }
 
   private static formatSize(size: number): string {
@@ -724,6 +1068,17 @@ struct LayerManagePage {
           .layoutWeight(1)
           .scrollBar(BarState.Off)
           .padding({ left: Theme.PAD, right: Theme.PAD, top: Theme.GAP, bottom: Theme.PAD })
+          .editMode(this.tab === TAB_VECTOR)
+          .onItemDragStart((event: ItemDragInfo, itemIndex: number): (() => void) | void => {
+            return this.handleDragStart(itemIndex);
+          })
+          .onItemDragMove((event: ItemDragInfo, itemIndex: number, insertIndex: number): void => {
+            this.handleDragMove(insertIndex);
+          })
+          .onItemDrop((event: ItemDragInfo, itemIndex: number, insertIndex: number,
+            isSuccess: boolean): void => {
+            this.handleDragDrop(isSuccess);
+          })
         }
       }
     }
@@ -868,7 +1223,11 @@ struct LayerManagePage {
         fillEnabled: row.fillEnabled,
         strokeColor: row.outline,
         strokeWidthValue: row.outlineWidth,
+        geomType: row.geomType,
+        iconKey: row.iconKey,
+        iconColor: row.iconColor,
         labelField: row.labelField,
+        labelText: row.labelText,
         labelColor: row.labelColor,
         labelScale: row.labelScale,
         labelOutline: row.labelOutline,

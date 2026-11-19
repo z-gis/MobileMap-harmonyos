@@ -36,9 +36,6 @@ import { SqlQueryController } from './SqlQueryController';
 
 const TAG: string = 'FeaturePickController';
 
-/** 属性写回支持的格式（GDAL 驱动能力矩阵：dwg 只读） */
-const WRITABLE_FORMATS: string[] = ['shp', 'dxf', 'gpkg', 'geojson', 'kml', 'kmz'];
-
 /** 要素详情请求：控制器组装、宿主渲染；attributes 在组装后异步回填 */
 export class FeatureDetailRequest {
   path: string = '';
@@ -47,6 +44,8 @@ export class FeatureDetailRequest {
   layerName: string = '';
   /** 几何类型：0 点 / 1 线 / 2 面 / -1 未知 */
   geomType: number = -1;
+  /** 几何构成掩码：bit0 点 / bit1 线 / bit2 面（可组合，KML 混合层按构成出节）；0 = 按 geomType 单几何 */
+  geomMask: number = 0;
   /** 量算文本（面=面积+周长、线=长度；点为空表示不显示该行） */
   geometryText: string = '';
   /** 单要素样式覆盖（保存时写回 layerInfo.vectorStyle.featureStyles[fid]） */
@@ -103,6 +102,13 @@ export class PickRouter {
    * 用它当判据，不限时也不限距，手指按住多久才放开都吞得住。
    */
   isPieMenuOpen: () => boolean = (): boolean => false;
+  /**
+   * 几何编辑态整体门控（宿主状态）：编辑期间单击不弹详情、长按不再弹圆菜单，
+   * 单击交由 handleEditTap 消费（画分割线加点 / 选合并目标）。
+   */
+  isGeomEditing: () => boolean = (): boolean => false;
+  /** 几何编辑态单击消费（画线加点/选靶）；恒消费，返回值仅表意 */
+  handleEditTap: (x: number, y: number) => boolean = (): boolean => false;
 }
 
 export class FeaturePickController {
@@ -118,6 +124,7 @@ export class FeaturePickController {
   private selectedHighlightIndex: number = -1;
   private selectedPath: string | undefined = undefined;
   private selectedFid: number = -1;
+  private selectedLayerName: string = '';
 
   constructor(view: NativeMapView, ctx: common.Context, layerManager: MapLayerController,
     overlayManager: BusinessOverlayManager, queryController: SqlQueryController,
@@ -143,6 +150,11 @@ export class FeaturePickController {
     // 菜单浮着时地图本就不该响应单击，故不限时、不限距，慢放开同样吞掉。
     if (this.router.isPieMenuOpen()) {
       AppLog.i(`${TAG} 圆菜单浮层未收起，忽略本次单击 (${x.toFixed(1)},${y.toFixed(1)})`);
+      return;
+    }
+    // 几何编辑态：单击整体交编辑控制器（画分割线加点/选合并目标），不弹详情、不改选中
+    if (this.router.isGeomEditing()) {
+      this.router.handleEditTap(x, y);
       return;
     }
     // 测量采集模式：拦截点击用于加点（优先于拾取）
@@ -191,8 +203,8 @@ export class FeaturePickController {
     if (path.length === 0) {
       return false;
     }
-    this.highlightSelectedFeature(layerIndex, fid, path);
-    this.showVectorFeatureDetail(path, fid);
+    this.highlightSelectedFeature(layerIndex, fid, path, info.layerName);
+    this.showVectorFeatureDetail(path, fid, info.layerName);
     return true;
   }
 
@@ -204,6 +216,9 @@ export class FeaturePickController {
    * 这里不再登记任何「抑制窗口」：菜单一浮起来，抬手补发的那次单击就由 onMapTap 的浮层判定吃掉，按住多久都一样。
    */
   onMapLongPress(x: number, y: number): void {
+    if (this.router.isGeomEditing()) {
+      return;
+    }
     if (this.measureController.capturing()) {
       return;
     }
@@ -245,12 +260,12 @@ export class FeaturePickController {
     // SQL 查询高亮层命中：点击穿透到源要素（该层已置 noPick，正常不会命中于此）
     const queryPath: string | undefined = this.queryController.sourcePathIfHit(layerIndex);
     if (queryPath !== undefined) {
-      this.showVectorFeatureDetail(queryPath, fid);
+      this.showVectorFeatureDetail(queryPath, fid, this.queryController.sourceLayerIfHit(layerIndex));
       return true;
     }
     // 点击选中高亮层命中：穿透回源要素详情（同上，仅作防护兜底）
     if (layerIndex === this.selectedHighlightIndex && this.selectedPath !== undefined) {
-      this.showVectorFeatureDetail(this.selectedPath, this.selectedFid);
+      this.showVectorFeatureDetail(this.selectedPath, this.selectedFid, this.selectedLayerName);
       return true;
     }
     return false;
@@ -260,7 +275,8 @@ export class FeaturePickController {
    * 画文件矢量要素的选中高亮：经 featureGeometry 取该要素经纬度几何（native 反投影，无文件 IO），
    * 用独立叠加层以黄色高亮样式覆盖渲染。切换选中先清旧高亮；高亮层置 noPick 不参与拾取。
    */
-  highlightSelectedFeature(layerIndex: number, fid: number, path: string): void {
+  highlightSelectedFeature(layerIndex: number, fid: number, path: string,
+    layerName: string = ''): void {
     this.clearSelectedHighlight();
     const fg: FeatureGeometry | undefined = this.view.featureGeometry(layerIndex, fid);
     if (fg === undefined) {
@@ -274,6 +290,7 @@ export class FeaturePickController {
     this.selectedHighlightIndex = idx;
     this.selectedPath = path;
     this.selectedFid = fid;
+    this.selectedLayerName = layerName;
     if (fg.type === 0) {
       this.view.updateOverlayPoints(idx, fg.lonlat, [fid]);
     } else if (fg.type === 1) {
@@ -293,6 +310,7 @@ export class FeaturePickController {
     this.selectedHighlightIndex = -1;
     this.selectedPath = undefined;
     this.selectedFid = -1;
+    this.selectedLayerName = '';
   }
 
   /** 叠加层重建（clearOverlayLayers）后调用：选中为瞬态交互，重建后仅重置失效索引 */
@@ -310,7 +328,7 @@ export class FeaturePickController {
    * ——KML/DXF 等格式首次回取需重开文件解析可达秒级，故不让弹窗等待。
    * 样式编辑限 shp/gpkg；属性编辑限可写格式且非 KML 系；样地调查入口限 shp 面要素。
    */
-  showVectorFeatureDetail(path: string, fid: number): void {
+  showVectorFeatureDetail(path: string, fid: number, layerName: string = ''): void {
     if (path.length === 0 || fid < 0) {
       return;
     }
@@ -318,8 +336,9 @@ export class FeaturePickController {
     let layerInfo: LayerInfo | undefined = undefined;
     if (doc !== null) {
       for (let i = 0; i < doc.vectorLayers.length; i++) {
-        if (doc.vectorLayers[i].path === path) {
-          layerInfo = doc.vectorLayers[i];
+        const l: LayerInfo = doc.vectorLayers[i];
+        if (l.path === path && (layerName.length === 0 || l.layerName === layerName)) {
+          layerInfo = l;
           break;
         }
       }
@@ -327,16 +346,18 @@ export class FeaturePickController {
     const ext: string = VectorFormats.extOf(path);
     // native 矢量层索引：供 featureGeometry 取几何类型（点/线/面）与量算
     const layerIndex: number = layerInfo === undefined ? -1 : this.layerManager.nativeIndexOf(layerInfo);
-    // shp/gpkg 均为 GDAL 索引矢量，支持整层/单要素样式覆盖；kml/kmz 无 fid、dwg/dxf 只读
-    const styleEditable: boolean = (ext === 'shp' || ext === 'gpkg') && fid >= 0;
-    // 属性可编辑：可写格式 + 有效 FID（编辑权限由页面「编辑」按键门控，此处只判定能力）
-    const attrsEditable: boolean = fid >= 0 && WRITABLE_FORMATS.indexOf(ext) >= 0
-      && ext !== 'kml' && ext !== 'kmz';
+    // 单要素样式覆盖：GDAL 索引矢量（shp/gpkg/gdb）+ 有效 FID；kml/kmz 无 fid、dwg 只读
+    const styleEditable: boolean = VectorFormats.featureStyleEditable(path) && fid >= 0;
+    // 属性可编辑：可写格式（排除 kml/kmz 自带样式）+ 有效 FID（编辑权限由页面「编辑」按键门控）
+    const attrsEditable: boolean = fid >= 0 && VectorFormats.attributeWritable(path)
+      && !VectorFormats.isKml(path);
     const fg: FeatureGeometry | undefined = layerIndex >= 0 ? this.view.featureGeometry(layerIndex, fid) : undefined;
     const req: FeatureDetailRequest = new FeatureDetailRequest();
     req.path = path;
     req.fid = fid;
-    req.layerName = layerInfo === undefined ? '' : (layerInfo.name ?? '');
+    // GDB 传要素类名；其余格式保持旧行为（传图层显示名）
+    req.layerName = layerInfo === undefined ? ''
+      : (layerInfo.layerName.length > 0 ? layerInfo.layerName : (layerInfo.name ?? ''));
     req.geomType = fg === undefined ? -1 : fg.type;
     req.geometryText = FeaturePickController.geometryText(fg);
     req.style = FeaturePickController.mergedStyle(layerInfo, fid);
@@ -344,7 +365,8 @@ export class FeaturePickController {
     req.attrsEditable = attrsEditable;
     // 样地调查入口：shp 面要素（不再依赖全局调查模式）
     req.surveyEntry = ext === 'shp' && req.geomType === 2 && fid >= 0;
-    const colors: string[] = this.layerManager.layerRenderColorsOf(path);
+    const colors: string[] = this.layerManager.layerRenderColorsOf(path,
+      layerInfo === undefined ? '' : layerInfo.layerName);
     req.fallbackFill = colors.length > 0 ? colors[0] : '';
     req.fallbackOutline = colors.length > 1 ? colors[1] : '';
     req.outerRingLatLon = FeaturePickController.outerRing(fg);
@@ -352,7 +374,8 @@ export class FeaturePickController {
     // 属性异步回取 + 就地回填（让出一帧保证弹窗先显示）
     setTimeout((): void => {
       const t0: number = Date.now();
-      const attrs: Map<string, string> | null = GdalVectorReader.getFeatureAttributes(path, fid);
+      const attrs: Map<string, string> | null = GdalVectorReader.getFeatureAttributes(path, fid,
+        req.layerName);
       req.attributes = attrs;
       if (attrs !== null) {
         const desc: string | undefined = FeaturePickController.descriptionOf(attrs);
@@ -428,13 +451,14 @@ export class FeaturePickController {
    * 属性写回（调查编辑）：调 GDAL 写回源文件。
    * 本侧无 gc renderable 属性缓存，故仅写回源文件（下次拾取/重载即取到新值）。
    */
-  persistAttributes(path: string, fid: number, pending: Map<string, string>): boolean {
+  persistAttributes(path: string, fid: number, pending: Map<string, string>,
+    layerName: string = ''): boolean {
     if (pending.size === 0) {
       return true;
     }
     let success: boolean = false;
     try {
-      success = GdalVectorReader.updateAttributes(path, fid, pending);
+      success = GdalVectorReader.updateAttributes(path, fid, pending, layerName);
     } catch (e) {
       AppLog.e('属性写回异常', e);
     }

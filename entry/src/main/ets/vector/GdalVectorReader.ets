@@ -11,6 +11,7 @@
 
 import { NativeLayerInfo, NativeVector } from '@zys/globecore';
 import { AppLog } from '../common/AppLog';
+import fs from '@ohos.file.fs';
 
 const TAG: string = 'GdalVectorReader';
 
@@ -100,14 +101,38 @@ export class VectorResult {
   }
 }
 
+/** 几何编辑结果（分割/删除/合并统一）：ok=false 时 error 为可展示提示 */
+export class GeomEditResult {
+  ok: boolean;
+  error: string;
+  /** 分割块数（仅分割有效） */
+  count: number;
+  /** 分割新建图斑 FID（最大块留原 FID，不在此列） */
+  newFids: number[];
+
+  constructor(ok: boolean, error: string = '', count: number = 0, newFids: number[] = []) {
+    this.ok = ok;
+    this.error = error;
+    this.count = count;
+    this.newFids = newFids;
+  }
+}
+
+interface GeomEditJson {
+  ok?: boolean;
+  error?: string;
+  count?: number;
+  newFids?: number[];
+}
+
 export class GdalVectorReader {
   /**
    * 快速统计要素总数（遍历全部子图层求和），供上层判定小数据集是否直接全量渲染。
    * 打开失败返回 -1。
    */
-  static countFeatures(path: string): number {
+  static countFeatures(path: string, layerName: string = ''): number {
     try {
-      return NativeVector.countVectorFeatures(path);
+      return NativeVector.countVectorFeatures(path, layerName);
     } catch (e) {
       AppLog.e(`统计要素数失败: ${path}`, e);
       return -1;
@@ -118,7 +143,8 @@ export class GdalVectorReader {
    * 按 FID 就地写回属性字段到源文件（仅改现有字段值）。
    * dwg 等只读驱动、无写权限、字段名不存在时返回 false；attrs 为空直接返回 true。
    */
-  static updateAttributes(path: string, featureId: number, attrs: Map<string, string>): boolean {
+  static updateAttributes(path: string, featureId: number, attrs: Map<string, string>,
+    layerName: string = ''): boolean {
     if (attrs.size === 0) {
       return true;
     }
@@ -132,10 +158,65 @@ export class GdalVectorReader {
       values.push(value);
     });
     try {
-      return NativeVector.updateFeatureAttributes(path, featureId, keys, values);
+      return NativeVector.updateFeatureAttributes(path, featureId, keys, values, layerName);
     } catch (e) {
-      AppLog.e(`属性写回失败: ${path} fid=${featureId}`, e);
+      AppLog.e(`属性写回失败: ${path} fid=${featureId} layer=${layerName}`, e);
       return false;
+    }
+  }
+
+  /**
+   * 删除要素（gdb/shp，任意几何类型）。backupDir 必传：进程内首次几何写前整份自动备份。
+   * shp 为标记删除（不自动 REPACK，文件体积不减属预期）。
+   */
+  static deleteFeature(path: string, featureId: number, layerName: string,
+    backupDir: string): GeomEditResult {
+    try {
+      const json: string = NativeVector.deleteVectorFeature(path, featureId, layerName, backupDir);
+      return GdalVectorReader.parseGeomEdit(json);
+    } catch (e) {
+      AppLog.e(`删除要素失败: ${path} fid=${featureId}`, e);
+      return new GeomEditResult(false, '原生库未加载，无法删除');
+    }
+  }
+
+  /**
+   * 按线分割面图斑：lineWkt 为 WGS84 折线 WKT（LINESTRING(lon lat,…)），首末段自动延长贯穿。
+   * 最大块留原 FID（属性不动），其余块复制属性新建；面积闭合门禁不过不落库。
+   */
+  static splitByLine(path: string, featureId: number, lineWkt: string, layerName: string,
+    backupDir: string): GeomEditResult {
+    try {
+      const json: string = NativeVector.splitPolygonByLine(path, featureId, lineWkt, layerName, backupDir);
+      return GdalVectorReader.parseGeomEdit(json);
+    } catch (e) {
+      AppLog.e(`分割图斑失败: ${path} fid=${featureId}`, e);
+      return new GeomEditResult(false, '原生库未加载，无法分割');
+    }
+  }
+
+  /** 合并两个面图斑：保留 fidKeep 的 FID 与属性，删除 fidRemove（不相离时结果为多部件） */
+  static mergeFeatures(path: string, fidKeep: number, fidRemove: number, layerName: string,
+    backupDir: string): GeomEditResult {
+    try {
+      const json: string = NativeVector.mergeVectorFeatures(path, fidKeep, fidRemove, layerName, backupDir);
+      return GdalVectorReader.parseGeomEdit(json);
+    } catch (e) {
+      AppLog.e(`合并图斑失败: ${path} fid=${fidKeep}+${fidRemove}`, e);
+      return new GeomEditResult(false, '原生库未加载，无法合并');
+    }
+  }
+
+  private static parseGeomEdit(json: string): GeomEditResult {
+    try {
+      const obj: GeomEditJson = JSON.parse(json) as GeomEditJson;
+      if (obj.ok === true) {
+        return new GeomEditResult(true, '', obj.count ?? 0, obj.newFids ?? []);
+      }
+      return new GeomEditResult(false, obj.error ?? '操作失败');
+    } catch (e) {
+      AppLog.e('解析几何编辑结果 JSON 失败', e);
+      return new GeomEditResult(false, '操作结果解析失败');
     }
   }
 
@@ -146,15 +227,16 @@ export class GdalVectorReader {
    */
   static readFeatures(path: string, extent: number[] | undefined = undefined,
     includeAllFields: boolean = true, labelField: string = '',
-    simplifyGeometry: boolean = false, simplifyTolerance: number = 0): VectorResult {
+    simplifyGeometry: boolean = false, simplifyTolerance: number = 0,
+    layerName: string = ''): VectorResult {
     let json: string | null = null;
     try {
       if (extent !== undefined && extent.length >= 4) {
         json = NativeVector.readVectorFeatures(path, extent[0], extent[1], extent[2], extent[3],
-          includeAllFields, labelField, simplifyGeometry, simplifyTolerance);
+          includeAllFields, labelField, simplifyGeometry, simplifyTolerance, layerName);
       } else {
         json = NativeVector.readVectorFeatures(path, Number.NaN, Number.NaN, Number.NaN, Number.NaN,
-          includeAllFields, labelField, simplifyGeometry, simplifyTolerance);
+          includeAllFields, labelField, simplifyGeometry, simplifyTolerance, layerName);
       }
     } catch (e) {
       AppLog.e(`readVectorFeatures 失败: ${path}`, e);
@@ -176,15 +258,16 @@ export class GdalVectorReader {
    * 按 FID 单要素属性回取（延迟属性读取配套）：shp/gpkg 索引 seek ~10-30ms。
    * 打开失败 / fid 未命中返回 null，由调用方回退已有缓存。
    */
-  static getFeatureAttributes(path: string, featureId: number): Map<string, string> | null {
+  static getFeatureAttributes(path: string, featureId: number,
+    layerName: string = ''): Map<string, string> | null {
     if (featureId < 0) {
       return null;
     }
     let json: string | null = null;
     try {
-      json = NativeVector.getFeatureAttributes(path, featureId);
+      json = NativeVector.getFeatureAttributes(path, featureId, layerName);
     } catch (e) {
-      AppLog.e(`属性回取失败: ${path} fid=${featureId}`, e);
+      AppLog.e(`属性回取失败: ${path} fid=${featureId} layer=${layerName}`, e);
       return null;
     }
     if (json === null || json === undefined) {
@@ -220,9 +303,9 @@ export class GdalVectorReader {
   }
 
   /** 字段名清单（SQL 查询字段列表用）；打开失败返回空数组 */
-  static fieldNames(path: string): string[] {
+  static fieldNames(path: string, layerName: string = ''): string[] {
     try {
-      return NativeLayerInfo.getVectorFieldNames(path);
+      return NativeLayerInfo.getVectorFieldNames(path, layerName);
     } catch (e) {
       AppLog.e(`取字段名失败: ${path}`, e);
       return [];
@@ -230,9 +313,9 @@ export class GdalVectorReader {
   }
 
   /** 图层四至 [minLon,minLat,maxLon,maxLat]（矢量优先、栅格兜底，非 WGS84 自动重投影）；失败 null */
-  static layerExtent(path: string): number[] | null {
+  static layerExtent(path: string, layerName: string = ''): number[] | null {
     try {
-      return NativeLayerInfo.getLayerExtent(path);
+      return NativeLayerInfo.getLayerExtent(path, layerName);
     } catch (e) {
       AppLog.e(`取图层四至失败: ${path}`, e);
       return null;
@@ -240,14 +323,78 @@ export class GdalVectorReader {
   }
 
   /** 图层坐标系描述文本（「名称\nproj4 定义」）；无法解析 null */
-  static layerSrs(path: string): string | null {
+  static layerSrs(path: string, layerName: string = ''): string | null {
     try {
-      return NativeLayerInfo.getLayerSrs(path);
+      return NativeLayerInfo.getLayerSrs(path, layerName);
     } catch (e) {
       AppLog.e(`取图层坐标系失败: ${path}`, e);
       return null;
     }
   }
+
+  /**
+   * 矢量首图层几何类型：0 点 / 1 线 / 2 面 / -1 未知或混合。
+   * 按 path+mtime 缓存：图层管理页逐行色块/宽度回显都要问几何类型，免每行每次重开 GDAL；
+   * 重导入覆盖同路径会改 mtime，缓存自然失效。
+   */
+  static geomTypeOf(path: string, layerName: string = ''): number {
+    if (path.length === 0) {
+      return -1;
+    }
+    let mtime: number = 0;
+    try {
+      mtime = fs.statSync(path).mtime;
+    } catch (e) {
+      return -1;
+    }
+    const key: string = `${path}|${layerName}|${mtime}`;
+    const hit: number | undefined = GdalVectorReader.geomCache.get(key);
+    if (hit !== undefined) {
+      return hit;
+    }
+    let type: number = -1;
+    try {
+      type = NativeLayerInfo.getLayerGeomType(path, layerName);
+    } catch (e) {
+      AppLog.e(`取图层几何类型失败: ${path}`, e);
+    }
+    GdalVectorReader.geomCache.set(key, type);
+    return type;
+  }
+
+  private static geomCache: Map<string, number> = new Map<string, number>();
+
+  /**
+   * 矢量图层几何构成掩码：bit0 点 / bit1 线 / bit2 面（可组合，如 KML 混合层=7）。
+   * KML 层声明 wkbUnknown 时 native 采样扫描要素；样式页按构成出节用。
+   * 缓存口径同 geomTypeOf（path+mtime，重导入自然失效）；失败 0。
+   */
+  static geomMaskOf(path: string, layerName: string = ''): number {
+    if (path.length === 0) {
+      return 0;
+    }
+    let mtime: number = 0;
+    try {
+      mtime = fs.statSync(path).mtime;
+    } catch (e) {
+      return 0;
+    }
+    const key: string = `${path}|${layerName}|${mtime}`;
+    const hit: number | undefined = GdalVectorReader.geomMaskCache.get(key);
+    if (hit !== undefined) {
+      return hit;
+    }
+    let mask: number = 0;
+    try {
+      mask = NativeLayerInfo.getLayerGeomMask(path, layerName);
+    } catch (e) {
+      AppLog.e(`取图层几何构成失败: ${path}`, e);
+    }
+    GdalVectorReader.geomMaskCache.set(key, mask);
+    return mask;
+  }
+
+  private static geomMaskCache: Map<string, number> = new Map<string, number>();
 
   private static peekError(json: string): string {
     try {

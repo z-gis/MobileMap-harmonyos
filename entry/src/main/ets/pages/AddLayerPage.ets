@@ -14,13 +14,14 @@ import { router } from '@kit.ArkUI';
 import { PageData, PageKeys } from '../common/PageData';
 import { Theme } from '../common/Theme';
 import { Ui } from '../common/Ui';
-import { LayerInfo } from '../doc/DocModels';
+import { LayerInfo, MapDocument } from '../doc/DocModels';
 import { DocumentManager } from '../doc/DocumentManager';
 import { ImportResult, VectorFileImporter, ImportCandidate } from '../vector/VectorFileImporter';
 import { LayerType, VectorFormats } from '../vector/VectorFormats';
 import { TitleBar } from '../components/TitleBar';
 import { NameEditDialog } from '../components/NameEditDialog';
 import { FolderFilePickDialog } from '../components/FolderFilePickDialog';
+import { OptionListDialog } from '../components/OptionListDialog';
 
 @Entry
 @Component
@@ -36,6 +37,7 @@ struct AddLayerPage {
   /** 弹窗控制器须挂成员字段：局部变量持有的控制器不会被框架注入弹窗（this.controller 为 undefined 致 close 崩溃） */
   private folderPickDialog: CustomDialogController | null = null;
   private nameDialog: CustomDialogController | null = null;
+  private gdbPickDialog: CustomDialogController | null = null;
 
   aboutToAppear(): void {
     this.folderSupported = canIUse('SystemCapability.FileManagement.UserFileService.FolderSelection');
@@ -191,6 +193,15 @@ struct AddLayerPage {
     let lastPath: string = '';
     for (let i = 0; i < candidates.length; i++) {
       const c: ImportCandidate = candidates[i];
+      // GDB 目录：整数据集拷入沙箱后按要素类挑选一个建层（与原 Android 一致）
+      if (c.isGdb) {
+        const r: ImportResult | null = await this.importGdbCandidate(doc, c);
+        if (r !== null) {
+          added.push(r.name);
+          lastPath = r.path;
+        }
+        continue;
+      }
       if (VectorFormats.isArchive(c.mainUri)) {
         const rs: ImportResult[] = await VectorFileImporter.importOne(c.mainUri);
         for (let j = 0; j < rs.length; j++) {
@@ -274,6 +285,76 @@ struct AddLayerPage {
     }
     this.imported = merged;
     Ui.toast(`已导入 ${added.length} 个图层`);
+  }
+
+  /**
+   * GDB 目录导入：整数据集拷入沙箱 → 枚举要素类 → 单个直接建层，多个弹「选择 GDB 图层」。
+   * 已存在的 path+layerName 跳过（与原 Android persistImportedVectorLayers 同口径）。
+   */
+  private async importGdbCandidate(doc: MapDocument, c: ImportCandidate): Promise<ImportResult | null> {
+    const results: ImportResult[] = VectorFileImporter.importGdbGroup(c, c.name);
+    if (results.length === 0) {
+      Ui.toast(`GDB 中未发现可导入要素类：${c.name}`);
+      return null;
+    }
+    let picked: ImportResult = results[0];
+    if (results.length > 1) {
+      const labels: string[] = [];
+      for (let i = 0; i < results.length; i++) {
+        labels.push(`${c.name}.gdb / ${results[i].layerName}`);
+      }
+      const choice: number = await this.askGdbLayer(labels);
+      if (choice < 0 || choice >= results.length) {
+        return null;
+      }
+      picked = results[choice];
+    }
+    for (let i = 0; i < doc.vectorLayers.length; i++) {
+      const l: LayerInfo = doc.vectorLayers[i];
+      if (l.path === picked.path && l.layerName === picked.layerName) {
+        Ui.toast(`该 GDB 图层已存在：${picked.layerName}`);
+        return null;
+      }
+    }
+    doc.vectorLayers.push(new LayerInfo(picked.name, picked.path, LayerInfo.TYPE_VECTOR, true,
+      picked.layerName));
+    return picked;
+  }
+
+  /** GDB 要素类单选（条数不定，走可滚动列表对话框）；取消返回 -1 */
+  private askGdbLayer(labels: string[]): Promise<number> {
+    return new Promise<number>((resolve: (v: number) => void): void => {
+      let settled: boolean = false;
+      const finish = (v: number): void => {
+        if (!settled) {
+          settled = true;
+          // 弹窗由持有 controller 的父级关闭（组件内不持有 controller）
+          this.gdbPickDialog?.close();
+          resolve(v);
+        }
+      };
+      const dlg: CustomDialogController = new CustomDialogController({
+        builder: OptionListDialog({
+          title: '选择 GDB 图层',
+          hint: '该数据集包含多个要素类，选择要加载的一个',
+          options: labels,
+          onPick: (index: number): void => {
+            finish(index);
+          },
+          onCancel: (): void => {
+            finish(-1);
+          },
+        }),
+        customStyle: true,
+        alignment: DialogAlignment.Center,
+        autoCancel: true,
+        cancel: (): void => {
+          finish(-1);
+        },
+      });
+      this.gdbPickDialog = dlg;
+      dlg.open();
+    });
   }
 
   /** 同类型图层列表里按显示名查冲突层（无则 undefined） */

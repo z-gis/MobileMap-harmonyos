@@ -28,7 +28,7 @@ struct SettingsPage {
   @State showTrackLayer: boolean = true;
   @State showMeasureLayer: boolean = true;
   @State coordDisplayMeter: boolean = false;
-  @State showKmlLabel: boolean = false;
+  @State showKmlLabel: boolean = true;
   @State viewMode3d: boolean = false;
   @State photoAddWatermark: boolean = true;
   @State backgroundLocation: boolean = false;

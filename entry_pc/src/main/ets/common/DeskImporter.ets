@@ -11,7 +11,18 @@ import zlib from '@ohos.zlib';
 import { DeskDirs } from './DeskDirs';
 import { DeskLog } from './DeskLog';
 
-/** 桌面端可添加的数据格式（矢量 + 栅格；读取能力由内核静态链接的 GDAL 驱动决定） */
+/**
+ * 桌面端可添加的数据格式（矢量 + 栅格；读取能力由内核静态链接的 GDAL 驱动决定）。
+ *
+ * 本表是手机端 entry/vector/VectorFormats.ets 主表的**桌面镜像**：HAP 之间不能互引，
+ * 业务层下沉 HSP 前（统一方案§四 N5/N6 单独立项）无法真正 import 主表，故自持一份并逐项对齐口径。
+ * 刻意分歧（改动主表时须同步评估此处）：
+ *  · VECTOR_EXTS 不含 gdb——桌面导入是「主文件+附属」扁平拷贝（importPicked），不支持 .gdb 目录数据集；
+ *    手机端 gdb 走目录整拷/枚举要素类，桌面要支持须另加目录导入逻辑，非 P0 纯重构范围。
+ *  · labelOf 文案保留桌面既有口径（zip/img/default 与主表措辞不同），属显示文本，不在 P0 强对齐。
+ *  · 无 virtualPathOf——桌面 kmz 由 DeskImporter 解压成真实目录后返回内部 kml 路径，GDAL 直开真实文件，
+ *    不经 /vsizip/ 虚拟文件系统（与手机端「原路径+/vsizip/」路线不同）。
+ */
 export class DeskFormats {
   static readonly VECTOR_EXTS: string[] = ['shp', 'gpkg', 'geojson', 'json', 'kml', 'kmz',
     'zip', 'dxf', 'dwg'];

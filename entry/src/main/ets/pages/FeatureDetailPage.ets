@@ -15,6 +15,7 @@
 // 还原不出成对行才退回备注级去标签纯文本。
 
 import { router } from '@kit.ArkUI';
+import { AppLog } from '../common/AppLog';
 import { ColorHex } from '../common/ColorHex';
 import { PageData, PageKeys, PageSignals } from '../common/PageData';
 import { Theme } from '../common/Theme';
@@ -117,7 +118,7 @@ struct FeatureDetailPage {
     this.req = raw as FeatureDetailRequest;
     this.initStyle();
     if (this.req.layerStyleMode) {
-      this.labelFields = GdalVectorReader.fieldNames(this.req.path);
+      this.labelFields = GdalVectorReader.fieldNames(this.req.path, this.req.layerName);
     }
     this.refreshAttrs();
     // 图层样式模式只有样式页（Android 会 removeTabAt 掉属性页），故不考量 styleEditable 直接停在样式页
@@ -135,7 +136,49 @@ struct FeatureDetailPage {
   // ── 可见性判定（与 Android 的 removeTabAt / visibility 分支等价）──────────────
 
   private isPointFeature(): boolean {
-    return !this.req.layerStyleMode && this.req.geomType === 0;
+    return this.req.geomType === 0;
+  }
+
+  /** 线要素（含整层样式模式）：隐藏填充、描边改名线色，保存只写线通道 */
+  private isLineFeature(): boolean {
+    return this.req.geomType === 1;
+  }
+
+  /** 混合几何（掩码含多类，KML 常见）：点/线/面节按构成同屏展示，各管各的渲染通道 */
+  private isMixedGeom(): boolean {
+    const m: number = this.req.geomMask;
+    return m !== 0 && (m & (m - 1)) !== 0;
+  }
+
+  private hasPointBit(): boolean {
+    return (this.req.geomMask & 1) !== 0;
+  }
+
+  private hasLineBit(): boolean {
+    return (this.req.geomMask & 2) !== 0;
+  }
+
+  private hasPolyBit(): boolean {
+    return (this.req.geomMask & 4) !== 0;
+  }
+
+  /** 点图标节可见：纯点层或混合层含点构成 */
+  private showIconSection(): boolean {
+    return this.isPointFeature() || (this.isMixedGeom() && this.hasPointBit());
+  }
+
+  /** 面节可见：非点非线（含混合层含面构成；未知几何保持面块旧行为） */
+  private showPolySection(): boolean {
+    if (this.isMixedGeom()) {
+      return this.hasPolyBit();
+    }
+    return !this.isPointFeature() && !this.isLineFeature();
+  }
+
+  /** 线色/描边行可见：线层、面节（描边）、混合层含线或面 */
+  private showStrokeRow(): boolean {
+    return this.isLineFeature() || this.showPolySection()
+      || (this.isMixedGeom() && (this.hasLineBit() || this.hasPolyBit()));
   }
 
   private showStyleTab(): boolean {
@@ -148,8 +191,7 @@ struct FeatureDetailPage {
 
   /** 标注区：kml/kmz 标注随源文件，文档覆盖无意义（Android labelSectionVisible=false） */
   private labelSectionVisible(): boolean {
-    const ext: string = VectorFormats.extOf(this.req.path);
-    return ext !== 'kml' && ext !== 'kmz';
+    return !VectorFormats.isKml(this.req.path);
   }
 
   private showStylePage(): boolean {
@@ -193,6 +235,9 @@ struct FeatureDetailPage {
     const width: number | undefined = s.outlineWidth;
     if (width !== undefined) {
       this.strokeW = Math.max(WIDTH_MIN, Math.min(WIDTH_MAX, Math.round(width)));
+    } else {
+      this.strokeW = this.isLineFeature() || (this.isMixedGeom() && this.hasLineBit())
+        ? Math.round(MapStyle.DEFAULT_LINE_WIDTH) : WIDTH_MIN;
     }
     this.iconKey = FeatureIcons.keyOf(s);
     this.labelColor = this.firstOf(s.labelColor, DEFAULT_LABEL);
@@ -216,6 +261,25 @@ struct FeatureDetailPage {
     const s: StyleOverride = new StyleOverride();
     if (this.isPointFeature()) {
       s.iconKey = this.iconKey;
+    } else if (this.isLineFeature()) {
+      // 线要素渲染只吃线通道：写填充无效且误导，故只落描边（=线色/线宽）
+      s.outlineColor = this.strokeColor;
+      s.outlineWidth = this.strokeW;
+    } else if (this.isMixedGeom()) {
+      // 混合几何：三通道同写（面填充/描边+线共用色宽/点图标），各通道渲染侧独立门控
+      if (this.hasPolyBit()) {
+        s.fillColor = this.fillColor;
+        if (!this.fillEnabled) {
+          s.fillEnabled = false;
+        }
+      }
+      if (this.hasLineBit() || this.hasPolyBit()) {
+        s.outlineColor = this.strokeColor;
+        s.outlineWidth = this.strokeW;
+      }
+      if (this.hasPointBit()) {
+        s.iconKey = this.iconKey;
+      }
     } else {
       s.fillColor = this.fillColor;
       if (!this.fillEnabled) {
@@ -337,6 +401,10 @@ struct FeatureDetailPage {
       }
     }
     const asTable: boolean = descPairs.length > 0;
+    // GDB 字段顺序随 FileGDB 内部存储，按中文排序规则归一展示（其余格式保持源顺序）
+    if (!asTable && VectorFormats.isGdb(this.req.path)) {
+      FeatureDetailPage.sortByChinese(realRows);
+    }
     const rows: AttrRow[] = asTable ? descPairs : realRows;
     this.descAsTable = asTable;
     this.descCaption = asTable ? caption : '';
@@ -349,6 +417,16 @@ struct FeatureDetailPage {
     this.rows = rows;
     if (!this.req.layerStyleMode) {
       this.labelFields = fields;
+    }
+  }
+
+  /** 属性行按中文排序规则（zh-Hans-CN）排序；Intl 不可用时保持原序 */
+  private static sortByChinese(rows: AttrRow[]): void {
+    try {
+      const coll = new Intl.Collator('zh-Hans-CN');
+      rows.sort((a: AttrRow, b: AttrRow): number => coll.compare(a.key, b.key));
+    } catch (e) {
+      AppLog.w('中文排序不可用，保持字段原序', `${e}`);
     }
   }
 
@@ -484,7 +562,7 @@ struct FeatureDetailPage {
       Ui.toast('地图未就绪，稍后再试');
       return;
     }
-    if (pick.persistAttributes(this.req.path, this.req.fid, this.pendingAttrs)) {
+    if (pick.persistAttributes(this.req.path, this.req.fid, this.pendingAttrs, this.req.layerName)) {
       router.back();
     }
   }
@@ -652,7 +730,7 @@ struct FeatureDetailPage {
   @Builder
   stylePage() {
     Column({ space: 4 }) {
-      if (this.isPointFeature()) {
+      if (this.showIconSection()) {
         this.sectionTitle('标识图标')
         Flex({ wrap: FlexWrap.Wrap }) {
           ForEach(FeatureIcons.keys(), (key: string): void => {
@@ -672,7 +750,8 @@ struct FeatureDetailPage {
         }
         .width('100%')
         .margin({ top: 4 })
-      } else {
+      }
+      if (this.showPolySection()) {
         this.sectionTitle('面样式')
         SwitchRow({
           title: '填充',
@@ -689,8 +768,13 @@ struct FeatureDetailPage {
             this.pickColor(TARGET_FILL);
           },
         })
+      }
+      if (this.showStrokeRow()) {
+        if (this.isLineFeature()) {
+          this.sectionTitle('线样式')
+        }
         ColorRow({
-          label: '描边色',
+          label: this.isLineFeature() ? '线色' : (this.isMixedGeom() ? '线色/描边' : '描边色'),
           color: this.strokeColor,
           onTap: (): void => {
             this.pickColor(TARGET_OUTLINE);

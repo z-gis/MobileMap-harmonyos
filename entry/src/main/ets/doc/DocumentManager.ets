@@ -296,8 +296,10 @@ export class DocumentManager {
     });
   }
 
-  /** 图层移入组（-1 = 未分组）；newGroupName 非空时同一次更新内先建组再落入 */
-  moveLayerToGroup(path: string, vector: boolean, groupId: number, newGroupName: string = ''): void {
+  /** 图层移入组（-1 = 未分组）；newGroupName 非空时同一次更新内先建组再落入。
+   *  layerName 用于区分同路径的 GDB 多要素类图层 */
+  moveLayerToGroup(path: string, vector: boolean, groupId: number, newGroupName: string = '',
+    layerName: string = ''): void {
     this.update((doc: MapDocument): void => {
       let target: number = groupId;
       if (newGroupName.length > 0) {
@@ -309,7 +311,7 @@ export class DocumentManager {
       }
       const list: LayerInfo[] = vector ? doc.vectorLayers : doc.rasterLayers;
       for (let i = 0; i < list.length; i++) {
-        if (list[i].path === path) {
+        if (list[i].path === path && list[i].layerName === layerName) {
           list[i].groupId = target;
           break;
         }
